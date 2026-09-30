@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta content="width=device-width, initial-scale=1.0" name="viewport"/>
-<title>ZenGate · Admin Dashboard</title>
+<title>OpenCode2API · Admin Dashboard</title>
 <script src="https://cdn.tailwindcss.com?plugins=forms,container-queries"></script>
 <script>
 tailwind.config = {
@@ -106,7 +106,7 @@ tailwind.config = {
       <span class="material-symbols-outlined text-xl" style="font-variation-settings:'FILL'1">bolt</span>
     </div>
     <div>
-      <h1 class="text-headline-sm text-headline-sm font-bold text-on-surface leading-tight">ZenGate</h1>
+      <h1 class="text-headline-sm text-headline-sm font-bold text-on-surface leading-tight">OpenCode2API</h1>
       <p class="text-label-md text-label-md text-secondary mt-0.5">Infrastructure Management</p>
     </div>
   </div>
@@ -145,7 +145,7 @@ tailwind.config = {
       <div class="w-9 h-9 rounded-full bg-primary-fixed flex items-center justify-center text-on-primary-fixed text-sm font-semibold">K</div>
       <div class="flex-1 min-w-0">
         <p class="text-body-md font-medium text-on-surface truncate">Admin</p>
-        <p class="text-label-md text-secondary">ZenGate</p>
+        <p class="text-label-md text-secondary">OpenCode2API</p>
       </div>
     </div>
   </div>
@@ -299,7 +299,7 @@ tailwind.config = {
             <span class="material-symbols-outlined text-lg">refresh</span>
             Refresh Candidates
           </button>
-          <button onclick="doAction('released/probe',this)" class="flex items-center gap-1.5 px-3 py-2 bg-surface border border-border text-secondary rounded-2xl text-label-md hover:border-primary hover:text-primary transition-colors cursor-pointer active:scale-[0.98]">
+          <button onclick="probeStandby(this)" class="flex items-center gap-1.5 px-3 py-2 bg-surface border border-border text-secondary rounded-2xl text-label-md hover:border-primary hover:text-primary transition-colors cursor-pointer active:scale-[0.98]">
             <span class="material-symbols-outlined text-lg">sensors</span>
             Probe Standby
           </button>

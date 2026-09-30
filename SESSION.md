@@ -1,9 +1,9 @@
-# ZenGate session state
+# OpenCode2API session state
 
 ## Current Status (last updated: 2026-07-23 11:55 CST)
 
 ### Running
-- Gateway container `zengate` on port 13339, working
+- Gateway container `opencode2api` on port 13339, working
 - 27273 candidates (4 sources + proxy-pool + FreeSub subscription)
 - FreeSub subscription: 129 SOCKS5 nodes added (dedup'd)
 - Subscription auto-refresh every 8h
@@ -53,8 +53,8 @@
 - Subscription parsed as source type, dedup'd on address
 
 ### Key commands
-- `docker logs --tail 50 zengate` — view recent requests
+- `docker logs --tail 50 opencode2api` — view recent requests
 - `docker compose -f docker-compose.yml up -d` — rebuild from host gate.ts
-- `docker build -t zengate . && docker compose up -d` — rebuild image + deploy
+- `docker build -t opencode2api . && docker compose up -d` — rebuild image + deploy
 - `curl -X POST http://localhost:13339/api/subscriptions -H 'Content-Type: application/json' -d '{"action":"refresh"}'` — force subscription refresh
 - `curl http://localhost:13339/api/status` — full status

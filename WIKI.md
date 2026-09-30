@@ -1,10 +1,10 @@
-# ZenGate Technical Documentation
+# OpenCode2API Technical Documentation
 
 > Per-Key IP Pool Reverse Proxy Gateway — Multi-IP round-robin proxy acceleration for opencode.ai/zen free AI models
 
 ## Project Overview
 
-ZenGate is a reverse proxy gateway written in TypeScript, specifically designed for free AI models (`-free` suffix) on [opencode.ai/zen](https://opencode.ai/zen). By aggregating multiple public proxy sources, subscription nodes, WARP tunnels, and custom proxies, it maintains an independent proxy Slot pool for each API Key. It achieves request-level round-robin scheduling and automatic failure failover/replacement to prevent single-IP rate limits (HTTP 429) or connection drops.
+OpenCode2API is a reverse proxy gateway written in TypeScript, specifically designed for free AI models (`-free` suffix) on [opencode.ai/zen](https://opencode.ai/zen). By aggregating multiple public proxy sources, subscription nodes, WARP tunnels, and custom proxies, it maintains an independent proxy Slot pool for each API Key. It achieves request-level round-robin scheduling and automatic failure failover/replacement to prevent single-IP rate limits (HTTP 429) or connection drops.
 
 **Core Features:**
 - Each API Key independently holds 3 proxy Slots (`SLOTS_PER_KEY`), with up to 20 keys active concurrently across the gateway (`MAX_ACTIVE_KEYS`)
@@ -310,9 +310,9 @@ curl -X POST http://localhost:13339/api/warp \
 
 ```yaml
 services:
-  zengate:
-    image: zengate:latest
-    container_name: zengate
+  opencode2api:
+    image: opencode2api:latest
+    container_name: opencode2api
     restart: always
     ports:
       - "13339:13339"
@@ -334,19 +334,19 @@ services:
 ### Build
 
 ```bash
-docker build -t zengate .
+docker build -t opencode2api .
 docker compose up -d
 ```
 
 ### docker run
 
 ```bash
-docker run -d --name zengate \
+docker run -d --name opencode2api \
   -p 13339:13339 \
   -v ./data:/app/data \
   -e API_KEY=admin123 \
   -e WARP_MODE=off \
-  zengate:latest
+  opencode2api:latest
 ```
 
 ### Dockerfile
@@ -430,7 +430,7 @@ curl http://localhost:13339/api/status | jq .
 curl http://localhost:13339/api/logs | jq .logs
 
 # Docker logs
-docker logs --tail 50 zengate
+docker logs --tail 50 opencode2api
 ```
 
 ### Subscriptions Not Taking Effect
@@ -460,7 +460,7 @@ curl -X POST http://localhost:13339/api/warp \
   -d '{"action":"enable"}'
 
 # Test WARP connectivity from inside Docker container
-docker exec zengate wget -q -O- --timeout=5 http://172.17.0.1:1080
+docker exec opencode2api wget -q -O- --timeout=5 http://172.17.0.1:1080
 ```
 
 If `warpStatus === 'stopped'` and `warpSkipUntil` is active, probes are temporarily skipped. Manually triggering enable resets the counter.
@@ -469,7 +469,7 @@ If `warpStatus === 'stopped'` and `warpSkipUntil` is active, probes are temporar
 
 ```bash
 # Rebuild after modifying gate.ts
-docker build -t zengate . && docker compose up -d
+docker build -t opencode2api . && docker compose up -d
 
 # Apply configuration changes in docker-compose.yml (no rebuild required)
 docker compose up -d
@@ -484,4 +484,4 @@ docker compose up -d
 
 ---
 
-*ZenGate v0.2.0 — See code comments in `gate.ts` for detailed module definitions.*
+*OpenCode2API v0.2.0 — See code comments in `gate.ts` for detailed module definitions.*

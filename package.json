@@ -1,5 +1,5 @@
 {
-  "name": "zengate",
+  "name": "opencode2api",
   "version": "0.2.0",
   "description": "Reverse proxy gateway with automatic proxy rotation for opencode.ai/zen free models",
   "type": "module",

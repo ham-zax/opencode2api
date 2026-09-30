@@ -1,19 +1,19 @@
-# Agent & Harness Integration Guide: ZenGate (`opencodezengate-freeapi`)
+# Agent & Harness Integration Guide: OpenCode2API (`opencode2api`)
 
-> Instructions for autonomous AI coding agents, harnesses, and tools (OpenCode2, Claude Code, Cursor, Agy, Antigravity, Cline, Continue) to launch, configure, and use ZenGate as a high-throughput, free AI model backend.
+> Instructions for autonomous AI coding agents, harnesses, and tools (OpenCode2, Claude Code, Cursor, Agy, Antigravity, Cline, Continue) to launch, configure, and use OpenCode2API as a high-throughput, free AI model backend.
 
 ---
 
 ## 1. Automated Setup & Startup (Agent Script)
 
-When an AI agent or automated harness starts up in an environment with ZenGate, it should ensure the gateway daemon is running:
+When an AI agent or automated harness starts up in an environment with OpenCode2API, it should ensure the gateway daemon is running:
 
-### Step 1: Check if ZenGate is Already Running
+### Step 1: Check if OpenCode2API is Already Running
 ```bash
 curl -s --connect-timeout 2 http://127.0.0.1:13339/api/status
 ```
 
-### Step 2: Start ZenGate in Background (If not running)
+### Step 2: Start OpenCode2API in Background (If not running)
 ```bash
 # From repository root
 nohup bun run gate-docker.ts > /dev/null 2>&1 &
@@ -28,10 +28,10 @@ done
 
 ## 2. Configuring the Harness: OpenCode & OpenCode2
 
-AI agents managing or interacting with the `opencode` / `opencode2` harness should register ZenGate into `~/.config/opencode/opencode.json`.
+AI agents managing or interacting with the `opencode` / `opencode2` harness should register OpenCode2API into `~/.config/opencode/opencode.json`.
 
 ### Automated Injection Script (Python)
-An agent can run this one-liner to safely inject or update the `zengate` provider in `opencode.json`:
+An agent can run this one-liner to safely inject or update the `opencode2api` provider in `opencode.json`:
 
 ```python
 import json, os
@@ -48,58 +48,58 @@ except Exception:
 if "provider" not in config:
     config["provider"] = {}
 
-config["provider"]["zengate"] = {
+config["provider"]["opencode2api"] = {
     "npm": "@ai-sdk/openai-compatible",
-    "name": "ZenGate",
+    "name": "OpenCode2API",
     "options": {
         "baseURL": "http://127.0.0.1:13339/v1",
         "apiKey": "admin123"
     },
     "models": {
         "big-pickle": {
-            "name": "Big Pickle (ZenGate Free)",
+            "name": "Big Pickle (OpenCode2API Free)",
             "reasoning": True,
             "limit": {"context": 200000, "output": 32000},
             "modalities": {"input": ["text"], "output": ["text"]}
         },
         "muse-spark-1.3-free": {
-            "name": "Muse Spark 1.3 Free (ZenGate)",
+            "name": "Muse Spark 1.3 Free (OpenCode2API)",
             "reasoning": True,
             "limit": {"context": 1048576, "output": 131072},
             "modalities": {"input": ["text", "image", "video", "pdf", "audio"], "output": ["text"]}
         },
         "muse-spark-1.2-free": {
-            "name": "Muse Spark 1.2 Free (ZenGate)",
+            "name": "Muse Spark 1.2 Free (OpenCode2API)",
             "reasoning": True,
             "limit": {"context": 1048576, "output": 131072},
             "modalities": {"input": ["text", "image", "video", "pdf", "audio"], "output": ["text"]}
         },
         "ling-3.0-flash-fin-free": {
-            "name": "Ling 3.0 Flash Fin (ZenGate Free)",
+            "name": "Ling 3.0 Flash Fin (OpenCode2API Free)",
             "reasoning": True,
             "limit": {"context": 262144, "output": 32768},
             "modalities": {"input": ["text"], "output": ["text"]}
         },
         "nemotron-3.5-lightning-free": {
-            "name": "Nemotron 3.5 Lightning (ZenGate Free)",
+            "name": "Nemotron 3.5 Lightning (OpenCode2API Free)",
             "reasoning": True,
             "limit": {"context": 262144, "output": 262144},
             "modalities": {"input": ["text", "image"], "output": ["text"]}
         },
         "nemotron-3-ultra-free": {
-            "name": "Nemotron 3 Ultra (ZenGate Free)",
+            "name": "Nemotron 3 Ultra (OpenCode2API Free)",
             "reasoning": True,
             "limit": {"context": 1000000, "output": 128000},
             "modalities": {"input": ["text"], "output": ["text"]}
         },
         "deepseek-v4-flash-free": {
-            "name": "DeepSeek V4 Flash (ZenGate Free)",
+            "name": "DeepSeek V4 Flash (OpenCode2API Free)",
             "reasoning": True,
             "limit": {"context": 200000, "output": 128000},
             "modalities": {"input": ["text"], "output": ["text"]}
         },
         "mimo-v2.5-free": {
-            "name": "MiMo 2.5 (ZenGate Free)",
+            "name": "MiMo 2.5 (OpenCode2API Free)",
             "reasoning": True,
             "limit": {"context": 200000, "output": 32000},
             "modalities": {"input": ["text", "image", "audio", "video"], "output": ["text"]}
@@ -110,7 +110,7 @@ config["provider"]["zengate"] = {
 with open(config_path, "w", encoding="utf-8") as f:
     json.dump(config, f, indent=4)
 
-print("ZenGate provider successfully configured in opencode.json!")
+print("OpenCode2API provider successfully configured in opencode.json!")
 ```
 
 ---
@@ -121,13 +121,13 @@ Once configured, agents can invoke `opencode2` non-interactively to perform subt
 
 ```bash
 # Run code generation with Claude Sonnet 4.6
-opencode2 run --model zengate/claude-sonnet-4-6 "Implement a TypeScript LRU cache"
+opencode2 run --model opencode2api/claude-sonnet-4-6 "Implement a TypeScript LRU cache"
 
 # Run fast reasoning with DeepSeek V4 Flash
-opencode2 run --model zengate/deepseek-v4-flash-free "Analyze and optimize this SQL query"
+opencode2 run --model opencode2api/deepseek-v4-flash-free "Analyze and optimize this SQL query"
 
 # Run high-context tasks with Gemini 3.7 Flash
-opencode2 run --model zengate/gemini-3.7-flash "Summarize the changes across all recent git commits"
+opencode2 run --model opencode2api/gemini-3.7-flash "Summarize the changes across all recent git commits"
 ```
 
 ---

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Scrape all free proxy pages from proxyhub.me, filter protocols supported by
-ZenGate (http/socks5), and push them to ZenGate via POST /api/proxies.
-The upstream ZenGate runtime only supports socks5/http; SOCKS4 is skipped.
+OpenCode2API (http/socks5), and push them to OpenCode2API via POST /api/proxies.
+The upstream OpenCode2API runtime only supports socks5/http; SOCKS4 is skipped.
 """
 import os, sys, time, json, urllib.request
 

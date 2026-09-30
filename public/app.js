@@ -1,5 +1,5 @@
 /* ============================================================
-   ZenGate · app.js (Local API Client)
+   OpenCode2API · app.js (Local API Client)
    ============================================================ */
 const $ = id => document.getElementById(id);
 const esc = s => String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
@@ -13,10 +13,33 @@ function toast(msg, type) {
     el.className = 'fixed bottom-7 left-1/2 -translate-x-1/2 z-[1000] flex items-center gap-2 px-6 py-3 rounded-xl shadow-2xl bg-[#111827] text-white text-sm font-medium opacity-0 pointer-events-none transition-all duration-300';
   }, 3000);
 }
+
+// /api/keys is admin-gated server-side. Hold the admin key in sessionStorage
+// and retry once through a prompt when the server answers 401, so the key
+// management UI keeps working without baking a credential into the bundle.
+const ADMIN_KEY_STORE = 'opencode2api.adminKey';
+function getAdminKey() { try { return sessionStorage.getItem(ADMIN_KEY_STORE) || ''; } catch { return ''; } }
+function setAdminKey(v) { try { v ? sessionStorage.setItem(ADMIN_KEY_STORE, v) : sessionStorage.removeItem(ADMIN_KEY_STORE); } catch {} }
 async function api(u, method, body) {
   const o = { method: method || 'GET', headers: { 'Content-Type': 'application/json' } };
   if (body) o.body = JSON.stringify(body);
-  const r = await fetch(u, o);
+  // Only the key-management routes need the admin credential. Sending it to
+  // every dashboard call would expose it to every handler and access log for
+  // no benefit — the other routes ignore Authorization entirely.
+  const needsAdmin = u.startsWith('/api/keys');
+  if (needsAdmin) {
+    const key = getAdminKey();
+    if (key) o.headers['Authorization'] = 'Bearer ' + key;
+  }
+  let r = await fetch(u, o);
+  if (r.status === 401 && needsAdmin) {
+    const entered = window.prompt('Admin key required (API_KEY):');
+    if (entered) {
+      setAdminKey(entered.trim());
+      o.headers['Authorization'] = 'Bearer ' + entered.trim();
+      r = await fetch(u, o);
+    }
+  }
   const d = await r.json();
   if (!r.ok) throw new Error(d.error || d.message || 'HTTP ' + r.status);
   return d;
@@ -107,6 +130,25 @@ async function doAction(path, btn) {
   if (currentTab === 'dashboard') fetchDashboard();
 }
 
+// Standby = WARP + the custom fallback proxies. Report which of them answered
+// so a press tells you something, rather than the bare "successful" toast the
+// generic action handler gives.
+async function probeStandby(btn) {
+  const orig = btn.innerHTML;
+  btn.innerHTML = '<span class="material-symbols-outlined text-lg animate-spin">sensors</span>';
+  btn.disabled = true;
+  try {
+    const r = await api('/api/standby/probe', 'POST', {});
+    const parts = [];
+    if (r.warp && r.warp.enabled) parts.push('WARP ' + (r.warp.healthy ? 'healthy' : 'unreachable'));
+    if (r.custom && r.custom.total) parts.push(r.custom.healthy + '/' + r.custom.total + ' fallback proxies up');
+    parts.push(r.readySlots + ' standby slot' + (r.readySlots === 1 ? '' : 's') + ' ready');
+    toast(parts.join(' · '), r.readySlots > 0 ? 'ok' : 'err');
+  } catch (e) { toast('Probe failed: ' + e.message, 'err'); }
+  btn.innerHTML = orig; btn.disabled = false;
+  if (currentTab === 'dashboard') fetchDashboard();
+}
+
 function statCard(icon, label, value, sub, color) {
   const colors = { primary:'bg-primary/10 text-primary', success:'bg-success/10 text-success', warning:'bg-warning/10 text-warning', info:'bg-info/10 text-info', red:'bg-error/10 text-error' };
   const c = colors[color] || colors.primary;
@@ -176,10 +218,24 @@ async function fetchModels() {
     const s = await api('/api/models');
     const el = $('testModel'); if(!el) return;
     const prev = el.value || localStorage.getItem('lastTestModel') || '';
-    el.innerHTML = s.models && s.models.length ? s.models.map(m => `<option value="${esc(m.id)}">${esc(m.id)}</option>`).join('') : '<option>No models available</option>';
-    if (prev && s.models && s.models.some(m => m.id === prev)) {
-      el.value = prev;
+    if (!s.models || !s.models.length) { el.innerHTML = '<option>No models available</option>'; return; }
+    // Models the gateway has not confirmed callable are still listed, but
+    // disabled and annotated — the gateway reroutes them, so a caller picking
+    // one would silently get a different model back.
+    const callable = new Set(Array.isArray(s.callableIds) && s.callableIds.length ? s.callableIds : s.models.map(m => m.id));
+    const withheld = new Map((s.withheld || []).map(w => [w.id, w]));
+    el.innerHTML = s.models.map(m => {
+      if (callable.has(m.id)) return `<option value="${esc(m.id)}">${esc(m.id)}</option>`;
+      const w = withheld.get(m.id) || {};
+      const why = w.status ? ` — unavailable (HTTP ${esc(String(w.status))})` : ' — unverified';
+      return `<option value="${esc(m.id)}" disabled>${esc(m.id)}${esc(why)}</option>`;
+    }).join('');
+    // A previously selected model may now be disabled; move to a working one.
+    if (!el.value || el.options[el.selectedIndex]?.disabled) {
+      const firstWorking = [...el.options].find(o => !o.disabled);
+      if (firstWorking) el.value = firstWorking.value;
     }
+    if (prev && s.models.some(m => m.id === prev) && callable.has(prev)) el.value = prev;
     localStorage.setItem('lastTestModel', el.value || '');
     el.addEventListener('change', () => localStorage.setItem('lastTestModel', el.value));
   } catch(_) { const el = $('testModel'); if(el) el.innerHTML = '<option>Failed to load</option>'; }
@@ -467,7 +523,9 @@ async function fetchSources() {
           esc(src.name||''),
           esc(src.type||'scraper'),
           src.count||0,
-          src.error ? badge('Error','red') : badge('Healthy','green'),
+          src.error
+            ? `<span title="${esc(src.error)}">${badge('Error','red')}</span>`
+            : badge('Healthy','green'),
           `<button onclick="deleteSource('${esc(src.name)}')" class="flex items-center justify-center w-8 h-8 rounded-2xl text-secondary hover:bg-error/10 hover:text-error transition-colors cursor-pointer" title="Delete"><span class="material-symbols-outlined text-[18px]">delete</span></button>`
         ]))
       );

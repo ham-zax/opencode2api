@@ -1,7 +1,7 @@
 #!/usr/bin/env bun 
 
 /**
- * ZenGate — SingBox Reverse Proxy Gateway
+ * OpenCode2API — SingBox Reverse Proxy Gateway
  * Uses sing-box subscription nodes + automatic 429 rotation + direct connection fallback
  */
 
@@ -925,9 +925,9 @@ async function handler(req: http.IncomingMessage, res: http.ServerResponse) {
         return;
       }
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
-      res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>ZenGate</title></head>
+      res.end(`<!DOCTYPE html><html><head><meta charset="utf-8"><title>OpenCode2API</title></head>
 <body style="font-family:monospace;margin:2em">
-<h2>🚀 ZenGate (SingBox Edition)</h2>
+<h2>🚀 OpenCode2API (SingBox Edition)</h2>
 <p>Uptime: ${Math.floor((Date.now() - START_TIME) / 1000)}s</p>
 <p>SingBox: ${SINGBOX_MODE === 'on' ? (singboxOk ? '✅ Healthy' : '❌ Offline') : '⏹️ Off'}</p>
 <p>Nodes: ${singboxNodes.length}</p>
@@ -1269,12 +1269,12 @@ server.on('request', (req, res) => {
 });
 
 server.listen(PORT, '0.0.0.0', async () => {
-  console.log(`\n[ZenGate] SingBox Edition started`);
-  console.log(`[ZenGate] Port: ${PORT}`);
-  console.log(`[ZenGate] Upstream: ${UPSTREAM}`);
-  console.log(`[ZenGate] SingBox: ${SINGBOX_MODE === 'on' ? `Socks5 ${SINGBOX_SOCKS_URL} / API ${SINGBOX_API_URL}` : 'Disabled'}`);
-  console.log(`[ZenGate] Data dir: ${DATA_DIR}`);
-  console.log(`[ZenGate] API Key: ${API_KEY}\n`);
+  console.log(`\n[OpenCode2API] SingBox Edition started`);
+  console.log(`[OpenCode2API] Port: ${PORT}`);
+  console.log(`[OpenCode2API] Upstream: ${UPSTREAM}`);
+  console.log(`[OpenCode2API] SingBox: ${SINGBOX_MODE === 'on' ? `Socks5 ${SINGBOX_SOCKS_URL} / API ${SINGBOX_API_URL}` : 'Disabled'}`);
+  console.log(`[OpenCode2API] Data dir: ${DATA_DIR}`);
+  console.log(`[OpenCode2API] API Key: ${API_KEY}\n`);
 
   // Load persisted data
   loadKeys();

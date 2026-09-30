@@ -3,7 +3,7 @@
   "configVersion": 0,
   "workspaces": {
     "": {
-      "name": "zengate",
+      "name": "opencode2api",
       "dependencies": {
         "geoip-lite": "^2.0.3",
         "hpagent": "^1.2.0",

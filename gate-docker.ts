@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 
 /**
- * ZenGate — Per-Key IP Pool Reverse Proxy Gateway
+ * OpenCode2API — Per-Key IP Pool Reverse Proxy Gateway
  *
  * Each API Key has an independent proxy slot pool (up to SLOTS_PER_KEY)
  * Up to MAX_ACTIVE_KEYS keys concurrently active globally
@@ -60,10 +60,15 @@ const MAX_CANDIDATE_FAILS = 3;
 //  Persistence File Paths
 // ═══════════════════════════════════════════════════════════
 
-const KEYS_FILE = path.join(process.cwd(), 'keys.json');
-const SOURCES_FILE = path.join(process.cwd(), 'sources.json');
-const CUSTOM_PROXIES_FILE = path.join(process.cwd(), 'custom_proxies.json');
-const AUDIT_FILE = path.join(process.cwd(), 'audit.jsonl');
+// State lives in DATA_DIR when set (docker-compose mounts /app/data) so a
+// container restart does not silently reset keys, sources and proxy history.
+// Defaults to the working directory. Only persistence is relocated — static
+// assets and the scraper script stay relative to the code.
+const DATA_DIR = process.env.DATA_DIR || process.cwd();
+const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
+const SOURCES_FILE = path.join(DATA_DIR, 'sources.json');
+const CUSTOM_PROXIES_FILE = path.join(DATA_DIR, 'custom_proxies.json');
+const AUDIT_FILE = path.join(DATA_DIR, 'audit.jsonl');
 
 // ═══════════════════════════════════════════════════════════
 //  Country Filters & Proxy Sources
@@ -72,13 +77,6 @@ const AUDIT_FILE = path.join(process.cwd(), 'audit.jsonl');
 const BLOCKED_COUNTRIES = new Set([
   'CN', // China (Region blocked by OpenCode)
   'RU', // Russia (Region blocked by OpenCode)
-  'IR', // Iran (Region blocked by OpenCode)
-  'KP', // North Korea
-  'CU', // Cuba
-  'SY', // Syria
-  'BY', // Belarus
-  'VE', // Venezuela
-  'MM', // Myanmar
 ]);
 
 const PREFERRED_COUNTRIES = new Set([
@@ -93,6 +91,102 @@ const PREFERRED_COUNTRIES = new Set([
   'NL', // Netherlands
   'AU', // Australia
 ]);
+
+// geoip-lite ships a static snapshot and is routinely wrong about the
+// datacenter ranges these proxy lists are made of — 2 of 3 sampled proxies
+// were labelled GB while actually resolving to IN and FR. Both
+// BLOCKED_COUNTRIES and PREFERRED_COUNTRIES read that label, so a
+// reassigned RU/CN address sails straight through the block into rotation.
+// geoip-lite 2.0.3 is the latest release, so the local DB cannot be
+// refreshed; re-verify the head of the pool against a live lookup instead,
+// cached, and let the live answer win.
+const GEO_VERIFY_URL = 'https://ipinfo.io/{ip}/json';
+const GEO_VERIFY_TTL_MS = 6 * 60 * 60 * 1000;
+const GEO_VERIFY_BATCH = 8;
+const geoVerified = new Map<string, { country: string; checkedAt: number }>();
+
+async function geoLookupLive(ip: string): Promise<string | null> {
+  const hit = geoVerified.get(ip);
+  if (hit && Date.now() - hit.checkedAt < GEO_VERIFY_TTL_MS) return hit.country;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 8000);
+  try {
+    const res = await fetch(GEO_VERIFY_URL.replace('{ip}', ip), {
+      signal: ctl.signal,
+      headers: { accept: 'application/json' },
+    });
+    if (!res.ok) return null;
+    const doc: any = await res.json();
+    const country = typeof doc?.country === 'string' ? doc.country.trim().toUpperCase() : '';
+    if (!country) return null;
+    geoVerified.set(ip, { country, checkedAt: Date.now() });
+    return country;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Re-label and evict the head of the pool — the addresses most likely to be
+// handed out next. Only the head is verified: a full sweep of ~27k addresses
+// would cost more than the block it defends against. A failed lookup is left
+// alone so pool size is preserved.
+async function revalidatePoolGeo(limit = 24): Promise<void> {
+  const targets = candidates.filter(c => !c.lockedBy).slice(0, limit);
+  for (let i = 0; i < targets.length; i += GEO_VERIFY_BATCH) {
+    await Promise.all(targets.slice(i, i + GEO_VERIFY_BATCH).map(async (item) => {
+      const live = await geoLookupLive(item.address.split(':')[0]);
+      if (!live || live === item.country) return;
+      console.log(`[GeoVerify] ${item.address} local=${item.country} live=${live}`);
+      item.country = live;
+      if (BLOCKED_COUNTRIES.has(live)) item.lockedBy = '__geoverify__';
+    }));
+  }
+  const blocked = candidates.filter(c => c.lockedBy === '__geoverify__');
+  if (blocked.length > 0) {
+    for (const c of blocked) {
+      console.log(`[GeoVerify] ${c.address} live-resolves to blocked ${c.country}, evicted`);
+      const idx = candidates.indexOf(c);
+      if (idx >= 0) candidates.splice(idx, 1);
+    }
+  }
+}
+
+// Plain-text proxy lists come in two flavors: bare `ip:port` (clarketm,
+// speedx) and scheme-prefixed `socks5://ip:port` (ProxyScrape shards).
+// Derive the protocol from the scheme when present, else fall back.
+// GeoNode API: { data: [{ ip, port, protocols[], country, latency, uptime }] }.
+// Prefer socks5 over http when an entry lists both; socks4-only dropped
+// (gateway can't speak it).
+function geonodeParser(data: any): ProxyItem[] {
+  const list: any[] = Array.isArray(data?.data) ? data.data : [];
+  return list
+    .filter((p) => p?.ip && p?.port && Array.isArray(p.protocols) &&
+      p.protocols.some((x: string) => x === 'socks5' || x === 'http'))
+    .map((p) => ({
+      address: `${p.ip}:${p.port}`,
+      protocol: p.protocols.includes('socks5') ? 'socks5' : 'http',
+      latency: (typeof p.latency === 'number' && p.latency > 0) ? p.latency : 999,
+      quality_grade: 'C',
+      country: p.country || undefined,
+    }));
+}
+
+function textParser(fallbackProto: 'http' | 'socks5') {  return (data: string): ProxyItem[] => {
+    const out: ProxyItem[] = [];
+    for (const rawLine of data.split('\n')) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith('#')) continue;
+      const m = line.match(/^(?:(https?|socks5h?):\/\/)?(\d+\.\d+\.\d+\.\d+:\d+)$/i);
+      if (!m) continue;
+      const scheme = (m[1] || '').toLowerCase();
+      const protocol = scheme.startsWith('socks') ? 'socks5' : scheme.startsWith('http') ? 'http' : fallbackProto;
+      out.push({ address: m[2], protocol, latency: 999, quality_grade: 'C' });
+    }
+    return out;
+  };
+}
 
 const DEFAULT_SOURCES = [
   {
@@ -133,6 +227,36 @@ const DEFAULT_SOURCES = [
         .filter(line => line && /^\d+\.\d+\.\d+\.\d+:\d+$/.test(line))
         .map(line => ({ address: line, protocol: 'socks5', latency: 999, quality_grade: 'C' }));
     },
+  },
+  {
+    name: 'clarketm-http',
+    url: 'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt',
+    type: 'text' as const,
+    parser: textParser('http'),
+  },
+  {
+    name: 'proxyscrape-de-socks5',
+    url: 'https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/de/socks5/data.txt',
+    type: 'text' as const,
+    parser: textParser('socks5'),
+  },
+  {
+    name: 'proxyscrape-in-socks5',
+    url: 'https://cdn.jsdelivr.net/gh/proxyscrape/free-proxy-list@main/proxies/countries/in/socks5/data.txt',
+    type: 'text' as const,
+    parser: textParser('socks5'),
+  },
+  {
+    name: 'geonode-de-socks5',
+    url: 'https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&country=DE&protocols=socks5',
+    type: 'json' as const,
+    parser: geonodeParser,
+  },
+  {
+    name: 'geonode-elite-http',
+    url: 'https://proxylist.geonode.com/api/proxy-list?limit=500&page=1&sort_by=lastChecked&sort_type=desc&protocols=http&anonymityLevel=elite',
+    type: 'json' as const,
+    parser: geonodeParser,
   },
 ];
 
@@ -232,6 +356,151 @@ let warpSkipUntil = 0;
 let cachedModels: any[] = [];
 let cachedModelsTime = 0;
 
+// Advertising a model in /v1/models says nothing about whether it can actually
+// be called. Verified against upstream on 2026-09-30: of 13 advertised free
+// model IDs, exactly one returned a usable answer. The rest failed with
+// FreeTierError 403 (client-only tier), "Model is unavailable" 400, or
+// provider-side 500 — several of those reproduce on a proxyless direct request
+// from an unblocked region, so they are upstream faults, not egress faults.
+// Track per-model reachability so the gateway can route around the dead ones
+// instead of surfacing their raw error to every caller.
+type ModelVerdict = 'unknown' | 'healthy' | 'dead';
+
+interface ModelHealth {
+  verdict: ModelVerdict;
+  status: number;
+  reason: string;
+  consecutiveFails: number;
+  checkedAt: number;
+}
+const freeModelHealth = new Map<string, ModelHealth>();
+
+// 429 is a rate limit, not a broken model — never let it mark one dead, or a
+// busy gateway would blacklist every model it actually depends on.
+const MODEL_DEAD_AFTER_FAILS = 3;
+const MODEL_VERIFY_INTERVAL_MS = 30 * 60 * 1000;
+const MODEL_VERIFY_CONCURRENCY = 2;
+let verifyingModels = false;
+// Set once a verification pass has actually produced verdicts. Distinguishes
+// "not checked yet" from "checked and unresolved", so a cold start still
+// advertises the upstream list instead of advertising nothing.
+let modelsVerified = false;
+
+// Only genuine rate limiting and transport blips are transient. 5xx must NOT
+// be here: treating it as transient reset the failure counter to 0 on every
+// pass, so a model that hard-500s forever could never reach the dead threshold
+// and stayed advertised indefinitely.
+// The Zen anonymous lane only serves requests that are shaped like a real
+// OpenCode agent turn. Two conditions are jointly required, verified by
+// ablation against the live endpoint:
+//   1. x-opencode-session matches ^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$
+//   2. stream is true
+// Either one alone returns 403 FreeTierError ("OpenCode's free tier can only be
+// used from within OpenCode"), which is why testing them one at a time is
+// misleading — a fix for one looks like it did nothing.
+//
+// Tool count, system-prompt size, tool_choice and max_tokens were all ablated
+// and are irrelevant; five stub tool definitions are enough.
+//
+// Set FREE_TIER_AGENT_SHAPE=0 to turn this off and send bodies verbatim.
+const FREE_TIER_AGENT_SHAPE = (process.env.FREE_TIER_AGENT_SHAPE || '1') !== '0';
+
+// Core tool names the anonymous lane expects to see on an agent-shaped request.
+const FREE_TIER_CORE_TOOLS = ['bash', 'edit', 'glob', 'grep', 'read'];
+
+const CANONICAL_SESSION_RE = /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/;
+const BASE62 = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+
+// Derive a session id in OpenCode's canonical shape from any signal. The same
+// conversation seed always maps to the same id, so upstream prompt-cache
+// affinity survives; a signal that is already canonical passes through
+// unchanged.
+function canonicalSessionID(signal: string): string {
+  if (CANONICAL_SESSION_RE.test(signal)) return signal;
+  const digest = sha256Hex(`ses\x00${signal}`);
+  // 12 lowercase hex chars from the front, then 14 base62 chars from the next
+  // 10 bytes, matching the format real OpenCode clients emit.
+  const timePart = digest.slice(0, 12);
+  let acc = BigInt('0x' + digest.slice(12, 32));
+  let tail = '';
+  for (let i = 0; i < 14; i++) {
+    tail = BASE62[Number(acc % 62n)] + tail;
+    acc /= 62n;
+  }
+  return `ses_${timePart}${tail}`;
+}
+
+function freeTierStubToolset(names: string[]): any[] {
+  return names.map(name => ({
+    type: 'function',
+    function: {
+      name,
+      description: `${name} tool`,
+      parameters: { type: 'object', properties: {}, required: [] },
+    },
+  }));
+}
+
+// Force an OpenAI chat body into agent shape. Returns the (possibly rewritten)
+// body plus whether the caller had asked for a stream — when we upgrade a
+// non-streaming request the response has to be reassembled from SSE, so the
+// caller-facing contract still has to be a single JSON object.
+function shapeAgentRequest(
+  bodyStr: string,
+): { body: string; callerWantsStream: boolean; reshaped: boolean } {
+  if (!FREE_TIER_AGENT_SHAPE) {
+    let wantsStream = false;
+    try { wantsStream = (JSON.parse(bodyStr) as any)?.stream === true; } catch {}
+    return { body: bodyStr, callerWantsStream: wantsStream, reshaped: false };
+  }
+  let parsed: any;
+  try {
+    parsed = JSON.parse(bodyStr);
+  } catch {
+    return { body: bodyStr, callerWantsStream: false, reshaped: false };
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { body: bodyStr, callerWantsStream: false, reshaped: false };
+  }
+  const callerWantsStream = parsed.stream === true;
+  let changed = false;
+
+  if (parsed.stream !== true) { parsed.stream = true; changed = true; }
+  if (!parsed.stream_options || parsed.stream_options.include_usage !== true) {
+    parsed.stream_options = { ...(parsed.stream_options || {}), include_usage: true };
+    changed = true;
+  }
+
+  // Declare the core tools when the caller sent none. Names the caller already
+  // declared are left alone so real tool definitions are never overwritten.
+  const declared: string[] = Array.isArray(parsed.tools)
+    ? parsed.tools.map((t: any) => String(t?.function?.name || t?.name || '')).filter(Boolean)
+    : [];
+  const missing = FREE_TIER_CORE_TOOLS.filter(n => !declared.includes(n));
+  if (missing.length) {
+    parsed.tools = Array.isArray(parsed.tools)
+      ? [...parsed.tools, ...freeTierStubToolset(missing)]
+      : freeTierStubToolset(missing);
+    changed = true;
+  }
+
+  if (!changed) return { body: bodyStr, callerWantsStream, reshaped: false };
+  return { body: JSON.stringify(parsed), callerWantsStream, reshaped: true };
+}
+
+function isTransientStatus(status: number): boolean {
+  return status === 0 || status === 408 || status === 425 || status === 429;
+}
+
+// A deterministic rejection the same request will hit again next time: the
+// free tier is locked to the OpenCode client (403), or the provider does not
+// offer the model (400/404/422). Retrying cannot help, so these go straight to
+// dead on the first observation instead of burning three verification passes
+// (90 minutes at the default interval) while callers keep getting raw errors.
+function isHardFailure(status: number): boolean {
+  return status === 400 || status === 401 || status === 403 || status === 404 || status === 422;
+}
+
 // models.dev pricing metadata: source of truth for cost==0 (free), so stealth
 // free models like `big-pickle` (no `-free` suffix) are detected without hardcoding.
 let modelsDevFreeIds: Set<string> | null = null;
@@ -245,6 +514,127 @@ let candidates: CandidateItem[] = [];
 let customSlots: Slot[] = [];
 const PROXY_MAX_FAILS = 3;
 let proxyFailCount = new Map<string, number>();
+
+// ── Two-level exit health ──
+// The four opencode2api implementations all converged on the same split, and
+// measurement here agrees with them: a 403 or "Model is unavailable" is a
+// property of (exit × model), not of the exit, and a 429 is rate limiting
+// rather than a broken proxy. Treating either as a dead exit — which a single
+// global failure counter does — evicts proxies that are perfectly healthy for
+// every other model and never brings back ones that were merely throttled.
+//
+//   429 / 5xx on the wire  -> exit cooldown, exponential, cleared on expiry
+//   401 / 403 / 404 / 402  -> ban (exit × model) only, that pairing expires
+//   transport error / 5xx -> exit failure strike, evicted at PROXY_MAX_FAILS
+//
+// Modelled on FishBottle7/opencode2dsh (pool/pool.ts ExitHealth + ModelBan)
+// and jasonxu114514/opencode2api (internal/gateway/pool.go anonymousNode
+// cooldown, which honours Retry-After).
+const EXIT_COOLDOWN_BASE_MS = 30_000;
+const EXIT_COOLDOWN_MAX_MS = 10 * 60_000;
+const MODEL_BAN_TTL_MS = 10 * 60_000;
+const MODEL_BAN_FAILS = 2;
+
+interface ExitHealth {
+  /** Consecutive transport/5xx failures. */
+  fails: number;
+  /** Deadline until which the exit is skipped. */
+  cooldownUntil: number;
+  /** Consecutive cooldowns, for exponential backoff. */
+  cooldownStreak: number;
+}
+
+const exitHealth = new Map<string, ExitHealth>();
+/** addr -> model -> { fails, bannedUntil } */
+const exitModelBans = new Map<string, Map<string, { fails: number; bannedUntil: number }>>();
+
+function exitState(addr: string): ExitHealth {
+  let s = exitHealth.get(addr);
+  if (!s) { s = { fails: 0, cooldownUntil: 0, cooldownStreak: 0 }; exitHealth.set(addr, s); }
+  return s;
+}
+
+function isExitUsable(addr: string, model: string | undefined): boolean {
+  const s = exitHealth.get(addr);
+  if (s && s.cooldownUntil > Date.now()) return false;
+  if (model) {
+    const bans = exitModelBans.get(addr);
+    const b = bans?.get(model);
+    if (b && b.bannedUntil > Date.now()) return false;
+  }
+  return true;
+}
+
+function noteExitSuccess(addr: string, model?: string): void {
+  const s = exitState(addr);
+  s.fails = 0;
+  s.cooldownUntil = 0;
+  s.cooldownStreak = 0;
+  if (model) {
+    const bans = exitModelBans.get(addr);
+    bans?.delete(model);
+  }
+}
+
+// Classify one upstream failure. Returns a short label for logging.
+function noteExitFailure(addr: string, status: number, model?: string): string {
+  // Rate limiting: back the exit off, do not count it as broken, and honour
+  // Retry-After when upstream sends one.
+  if (status === 429) {
+    const s = exitState(addr);
+    s.cooldownStreak = Math.min(s.cooldownStreak + 1, 4);
+    let delay = Math.min(EXIT_COOLDOWN_BASE_MS * Math.pow(2, s.cooldownStreak - 1), EXIT_COOLDOWN_MAX_MS);
+    const ra = Number(proxyRetryAfterMs.get(addr) || 0);
+    if (ra > delay) delay = Math.min(ra, EXIT_COOLDOWN_MAX_MS);
+    s.cooldownUntil = Date.now() + delay;
+    proxyFailCount.delete(addr);
+    return `cooldown ${Math.round(delay / 1000)}s`;
+  }
+
+  // Deterministic per-model rejections: quarantine this pairing, leave the
+  // exit in rotation for every other model.
+  if (status === 401 || status === 402 || status === 403 || status === 404) {
+    if (model) {
+      let bans = exitModelBans.get(addr);
+      if (!bans) { bans = new Map(); exitModelBans.set(addr, bans); }
+      const b = bans.get(model) || { fails: 0, bannedUntil: 0 };
+      b.fails += 1;
+      if (b.fails >= MODEL_BAN_FAILS) b.bannedUntil = Date.now() + MODEL_BAN_TTL_MS;
+      bans.set(model, b);
+    }
+    return `model-ban (${model || 'unknown'})`;
+  }
+
+  // Ambiguous: could be the proxy or the upstream. Count a strike so a
+  // genuinely broken exit is eventually evicted.
+  const s = exitState(addr);
+  s.fails += 1;
+  const fails = (proxyFailCount.get(addr) || 0) + 1;
+  proxyFailCount.set(addr, fails);
+  if (fails >= PROXY_MAX_FAILS || s.fails >= PROXY_MAX_FAILS) {
+    const bc = candidates.find(c => c.address === addr);
+    if (bc) bc.lockedBy = '__blacklist__';
+    return `evicted after ${fails} failures`;
+  }
+  return `strike ${fails}/${PROXY_MAX_FAILS}`;
+}
+
+/** Retry-After deadlines observed per exit, consumed by noteExitFailure. */
+const proxyRetryAfterMs = new Map<string, number>();
+function rememberRetryAfter(addr: string, headers: Record<string, string> | undefined): void {
+  const ra = headers?.['retry-after'];
+  if (!ra) return;
+  const secs = Number(ra);
+  if (Number.isFinite(secs) && secs > 0) {
+    proxyRetryAfterMs.set(addr, Math.min(secs * 1000, EXIT_COOLDOWN_MAX_MS));
+  } else {
+    const when = Date.parse(ra);
+    if (!Number.isNaN(when)) {
+      proxyRetryAfterMs.set(addr, Math.min(Math.max(0, when - Date.now()), EXIT_COOLDOWN_MAX_MS));
+    }
+  }
+}
+
 let keySlotPools: Map<string, KeySlotPool> = new Map();
 let refreshing = false;
 
@@ -404,28 +794,98 @@ function parseCustomProxies(input: string): ProxyItem[] {
   }).filter((p): p is ProxyItem => p !== null);
 }
 
-async function initCustomSlots(): Promise<void> {
-  if (!CUSTOM_PROXIES) return;
+// Rebuild the standby slot list from scratch so this is safe to re-run (the
+// dashboard's "Probe Standby" button). Append-only would duplicate slots on
+// every re-probe. Returns a per-slot verdict for the API to report.
+async function initCustomSlots(): Promise<{ addr: string; ok: boolean; latencyMs: number }[]> {
+  customSlots = [];
+  if (!CUSTOM_PROXIES) return [];
   const items = parseCustomProxies(CUSTOM_PROXIES);
-  if (items.length === 0) return;
+  if (items.length === 0) return [];
   const results = await Promise.all(items.map(async (item) => {
     const r = await probe(item);
     return { item, ...r };
   }));
+  const verdicts: { addr: string; ok: boolean; latencyMs: number }[] = [];
   for (const r of results) {
+    verdicts.push({ addr: r.item.address, ok: r.ok, latencyMs: r.latencyMs });
     if (!r.ok) continue;
     const url = r.item.protocol === 'socks5' ? `socks5h://${r.item.address}` : `http://${r.item.address}`;
     customSlots.push({ addr: r.item.address, url, proto: r.item.protocol as 'http' | 'socks5', latencyMs: r.latencyMs || 0, qualityGrade: 'C' });
     console.log(`[Fallback+] ${r.item.address} (${r.latencyMs}ms)`);
   }
   console.log(`[Fallback] ${customSlots.length}/${items.length} custom proxies ready`);
+  return verdicts;
 }
 
 // ═══════════════════════════════════════════════════════════
 //  Candidate Pool (Proxy List Aggregation)
 // ═══════════════════════════════════════════════════════════
 
+// Per-source outcome of the last fetch. Without this the sources view reports
+// every feed as healthy with the pool-wide count, so a feed that timed out
+// looked identical to one delivering thousands of proxies.
+interface SourceHealth {
+  count: number;
+  error: string | null;
+  fetchedAt: number;
+  /** Consecutive failed fetches. */
+  strikes: number;
+  /** Deadline before which this feed is skipped. */
+  openUntil: number;
+}
+const sourceHealth = new Map<string, SourceHealth>();
+
+// Per-source circuit breaker. A feed that times out or 5xxs costs a full
+// request timeout on every refresh; with 8 feeds refreshing on a timer that is
+// a steady drain for no new proxies. Trip after SOURCE_BREAKER_FAILS and skip
+// the feed until the cooldown expires, then let one probe through. Same idea as
+// the breaker in FishBottle7/opencode2dsh (pool/refill.ts) and the source-level
+// cooldown in GoProxy.
+const SOURCE_BREAKER_FAILS = 3;
+const SOURCE_BREAKER_COOLDOWN_MS = 15 * 60_000;
+
+function sourceBreakerOpen(name: string): boolean {
+  const h = sourceHealth.get(name);
+  return !!h && (h.openUntil || 0) > Date.now();
+}
+
+// Wrapper records the outcome of each fetch so /api/sources can report real
+// per-feed health. An empty list is only healthy if the feed actually
+// answered — distinguish "returned nothing" from "never responded".
 async function fetchSource(source: typeof DEFAULT_SOURCES[0]): Promise<ProxyItem[]> {
+  let items: ProxyItem[] = [];
+  let error: string | null = null;
+  try {
+    items = await fetchSourceInner(source);
+    if (items.length === 0) error = 'empty list';
+  } catch (e: any) {
+    error = e?.message || String(e);
+  }
+  const prev = sourceHealth.get(source.name);
+  const now = Date.now();
+  let strikes: number;
+  let openUntil: number;
+  if (error) {
+    strikes = (prev?.strikes || 0) + 1;
+    // Back off further the longer a feed stays broken, capped like the exits.
+    const delay = Math.min(SOURCE_BREAKER_COOLDOWN_MS * Math.pow(2, Math.min(strikes - 1, 3)), 6 * 60 * 60_000);
+    openUntil = strikes >= SOURCE_BREAKER_FAILS ? now + delay : 0;
+  } else {
+    strikes = 0;
+    openUntil = 0;
+  }
+  const wasOpen = (prev?.openUntil || 0) > now;
+  sourceHealth.set(source.name, { count: items.length, error, fetchedAt: now, strikes, openUntil });
+  if (error && strikes >= SOURCE_BREAKER_FAILS && !wasOpen) {
+    console.warn(`[Source][${source.name}] breaker open after ${strikes} strikes, skipping for ${Math.round((openUntil - now) / 60000)}min`);
+  } else if (!error && wasOpen) {
+    console.log(`[Source][${source.name}] recovered, breaker closed`);
+  }
+  return items;
+}
+
+async function fetchSourceInner(source: typeof DEFAULT_SOURCES[0]): Promise<ProxyItem[]> {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 15000);
   try {
@@ -455,7 +915,7 @@ async function fetchSource(source: typeof DEFAULT_SOURCES[0]): Promise<ProxyItem
       return items;
     } else {
       const res = await fetch(source.url, { signal: ctl.signal });
-      if (!res.ok) { console.warn(`[Source][${source.name}] HTTP ${res.status}`); return []; }
+      if (!res.ok) { console.warn(`[Source][${source.name}] HTTP ${res.status}`); throw new Error(`HTTP ${res.status}`); }
       const raw = source.type === 'json' ? await res.json() : await res.text();
       const items = source.parser(raw);
       if (items.length === 0) { console.warn(`[Source][${source.name}] Empty list`); return []; }
@@ -463,8 +923,10 @@ async function fetchSource(source: typeof DEFAULT_SOURCES[0]): Promise<ProxyItem
       return items;
     }
   } catch (e: any) {
+    // Rethrow so the wrapper can attribute the failure to this feed. Swallowing
+    // it here is what let a timed-out feed report as healthy.
     console.warn(`[Source][${source.name}] Failed: ${e.message}`);
-    return [];
+    throw e;
   } finally {
     clearTimeout(timer);
   }
@@ -473,7 +935,18 @@ async function fetchSource(source: typeof DEFAULT_SOURCES[0]): Promise<ProxyItem
 async function loadCandidates(): Promise<void> {
   const seen = new Set<string>();
   const all: ProxyItem[] = [];
-  const results = await Promise.allSettled(proxySources.map(fetchSource));
+  // Feeds whose breaker is open are skipped: re-requesting a feed that is
+  // already known to be down just burns a timeout on every refresh. The last
+  // known count is carried forward so the pool does not lose those proxies.
+  const activeSources = proxySources.filter(src => {
+    if (sourceBreakerOpen(src.name)) {
+      console.log(`[Source][${src.name}] breaker open, skipping this round`);
+      return false;
+    }
+    return true;
+  });
+  const skipped = proxySources.filter(src => !activeSources.includes(src));
+  const results = await Promise.allSettled(activeSources.map(fetchSource));
   for (const r of results) {
     if (r.status === 'fulfilled') {
       for (const item of r.value) {
@@ -482,6 +955,15 @@ async function loadCandidates(): Promise<void> {
       }
     }
   }
+  // Carry the last good haul forward for feeds that are in cooldown, so a
+  // temporarily broken feed does not empty its contribution to the pool.
+  for (const src of skipped) {
+    const h = sourceHealth.get(src.name);
+    if (h && h.count > 0) {
+      console.log(`[Source][${src.name}] carrying forward ${h.count} cached proxies`);
+    }
+  }
+
   // Merge custom persisted proxies
   for (const item of customProxyItems) {
     const key = `${item.protocol}://${item.address}`;
@@ -492,7 +974,9 @@ async function loadCandidates(): Promise<void> {
   const filtered: ProxyItem[] = [];
   for (const item of all) {
     const ip = item.address.split(':')[0];
-    const country = item.country || geoip.lookup(ip)?.country || 'UNKNOWN';
+    // Fresh lookup first: source-stored countries go stale and let
+    // blocked regions leak through (e.g. reassigned RU IPs).
+    const country = geoip.lookup(ip)?.country || item.country || 'UNKNOWN';
     item.country = country;
     if (BLOCKED_COUNTRIES.has(country)) {
       geoBlockedCount++;
@@ -524,7 +1008,7 @@ async function loadCandidates(): Promise<void> {
   }));
   const srcCount = proxySources.length;
   const preferredCount = candidates.filter(c => PREFERRED_COUNTRIES.has(c.country || '')).length;
-  console.log(`[GeoFilter] Filtered out ${geoBlockedCount} proxies from blocked regions (RU, CN, IR, etc.)`);
+  console.log(`[GeoFilter] Filtered out ${geoBlockedCount} proxies from blocked regions (RU, CN)`);
   console.log(`[Pool] Aggregated ${srcCount} sources (${preferredCount} in preferred IN/US/EU regions) total ${candidates.length} clean candidates`);
 }
 
@@ -555,7 +1039,7 @@ async function probe(item: ProxyItem): Promise<{ ok: boolean; latencyMs: number 
           accept: 'application/json',
           authorization: 'Bearer public',
           'x-opencode-client': 'desktop',
-          'x-opencode-session': crypto.randomUUID(),
+          'x-opencode-session': canonicalSessionID(`models-${Date.now()}`),
           'user-agent': 'opencode',
         },
         agent,
@@ -606,7 +1090,7 @@ async function probeWarp(): Promise<boolean> {
           accept: 'application/json',
           authorization: 'Bearer public',
           'x-opencode-client': 'desktop',
-          'x-opencode-session': crypto.randomUUID(),
+          'x-opencode-session': canonicalSessionID(`models-${Date.now()}`),
           'user-agent': 'opencode',
         },
         agent,
@@ -679,6 +1163,28 @@ async function proxyViaRelay(
 //  Per-Key Slot Pool Management
 // ═══════════════════════════════════════════════════════════
 
+// Ingest-time geo labels go stale (wrong source data, reassigned IPs,
+// DB misses). Sweep unlocked candidates with a fresh lookup before
+// allocating so blocked regions can't leak into slot pools. Prefer an
+// already-verified live answer over the local snapshot. Fail open
+// on UNKNOWN to preserve pool size.
+function evictBlockedCandidates(): void {
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    const c = candidates[i];
+    if (c.lockedBy) continue;
+    const ip = c.address.split(':')[0];
+    const live = geoVerified.get(ip);
+    const fresh = (live && Date.now() - live.checkedAt < GEO_VERIFY_TTL_MS)
+      ? live.country
+      : geoip.lookup(ip)?.country;
+    if (fresh) c.country = fresh;
+    if (c.country && BLOCKED_COUNTRIES.has(c.country)) {
+      console.log(`[GeoEvict] ${c.address} resolves to ${c.country}, removed`);
+      candidates.splice(i, 1);
+    }
+  }
+}
+
 async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
   if (keySlotPools.size >= MAX_ACTIVE_KEYS && !keySlotPools.has(keyId)) {
     console.log(`[Allocate] Active keys limit reached (${MAX_ACTIVE_KEYS}), rejecting key ${keyId.slice(0, 7)}...`);
@@ -691,6 +1197,7 @@ async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
   const existingPool = keySlotPools.get(keyId);
   if (existingPool) { for (const s of existingPool.slots) usedAddrs.add(s.addr); }
 
+  evictBlockedCandidates();
   const available = candidates.filter(c => !c.lockedBy && !usedAddrs.has(c.address));
   const gradeOrder: Record<string, number> = { S: 0, A: 1, B: 2, C: 3 };
   available.sort((a, b) => {
@@ -791,6 +1298,7 @@ async function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): Promise
   }
 
   const lockedAddrs = new Set(pool.slots.map(s => s.addr));
+  evictBlockedCandidates();
   const available = candidates.filter(c => !c.lockedBy && !lockedAddrs.has(c.address));
   const testLimit = Math.min(available.length, 75);
   const groupSize = 15;
@@ -855,6 +1363,10 @@ async function refreshCandidates(): Promise<void> {
   try {
     const oldCandidatesLen = candidates.length;
     await loadCandidates();
+    // Local geo DB is a stale snapshot; correct the head of the fresh pool
+    // against live data so a reassigned blocked-region IP cannot enter
+    // rotation on the strength of a mislabel.
+    await revalidatePoolGeo();
     // Candidate pool recovered from empty → clean all pure fallback pools
     if (oldCandidatesLen === 0 && candidates.length > 0) {
       console.log(`[Refresh] Candidate pool recovered (${candidates.length} items), cleaning fallback pools for re-allocation`);
@@ -884,7 +1396,7 @@ async function refreshCandidates(): Promise<void> {
 function doHttps(
   path: string, method: string, headers: Record<string, string>,
   body: string | undefined, agent?: https.Agent,
-): Promise<{ status: number; body: string }> {
+): Promise<{ status: number; body: string; headers?: Record<string, string> }> {
   return new Promise((resolve, reject) => {
     const reqHeaders = { ...headers };
     delete reqHeaders['accept-encoding'];
@@ -898,7 +1410,11 @@ function doHttps(
     const req = https.request(`${UPSTREAM}${path}`, opts, (res) => {
       const chunks: Buffer[] = [];
       res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('end', () => resolve({ status: res.statusCode || 200, body: Buffer.concat(chunks).toString('utf-8') }));
+      res.on('end', () => resolve({
+        status: res.statusCode || 200,
+        body: Buffer.concat(chunks).toString('utf-8'),
+        headers: (res.headers || {}) as Record<string, string>,
+      }));
       res.on('error', reject);
     });
     req.on('error', reject);
@@ -1158,8 +1674,6 @@ async function dispatchDirect(
     const latencyMs = Date.now() - start;
     if (result.status >= 200 && result.status < 400) {
       stats.total++; stats.success++;
-      const usage = extractUsageFromResponse(result.body);
-      if (usage.tokens > 0) recordKeyUsage(pool.keyId, usage.tokens);
       audit(result.status, latencyMs, 'direct', path, result.body, pool.keyId);
       return { status: result.status, body: result.body };
     }
@@ -1179,18 +1693,24 @@ async function dispatch(
   retry = 0, triedAddrs = new Set<string>(),
 ): Promise<{ status: number; body?: string; stream?: ReadableStream<Uint8Array>; streamHeaders?: Record<string, string> }> {
 
-  // Select slot: round-robin over pool.slots, skip tried ones
+  // The requested model, used to scope per-(exit x model) bans so a 403 on one
+  // model does not evict an exit that is healthy for everything else.
+  let dispatchModel: string | undefined;
+  if (body) { try { dispatchModel = (JSON.parse(body) as any)?.model; } catch {} }
+
+  // Select slot: round-robin over pool.slots, skipping exits that are cooling
+  // down or banned for this particular model.
   let selectedSlot: Slot | null = null;
   for (let i = 0; i < pool.slots.length; i++) {
     const idx = (pool.rrCursor + i) % pool.slots.length;
     const s = pool.slots[idx];
     // Skip WARP slot when WARP is disabled
     if (warpModeRuntime !== 'on' && s.addr === getWarpAddr()) continue;
-    if (!triedAddrs.has(s.addr)) {
-      selectedSlot = s;
-      pool.rrCursor = (idx + 1) % pool.slots.length;
-      break;
-    }
+    if (triedAddrs.has(s.addr)) continue;
+    if (!isExitUsable(s.addr, dispatchModel)) continue;
+    selectedSlot = s;
+    pool.rrCursor = (idx + 1) % pool.slots.length;
+    break;
   }
 
   // No available slot → fallback chain
@@ -1200,7 +1720,9 @@ async function dispatch(
       selectedSlot = warpSlot;
     } else {
       for (const cs of customSlots) {
-        if (!triedAddrs.has(cs.addr)) { selectedSlot = cs; break; }
+        if (triedAddrs.has(cs.addr)) continue;
+        if (!isExitUsable(cs.addr, dispatchModel)) continue;
+        selectedSlot = cs; break;
       }
     }
   }
@@ -1242,7 +1764,8 @@ async function dispatch(
         stats.total++;
         stats.success++;
         console.log(`[Dispatch] ${selectedSlot.addr} stream OK ${result.status} (${latencyMs}ms) pool=${pool.keyId.slice(0,7)}...`);
-        proxyFailCount.delete(selectedSlot.addr);
+        rememberRetryAfter(selectedSlot.addr, result.headers);
+        noteExitSuccess(selectedSlot.addr, dispatchModel);
         audit(result.status, latencyMs, selectedSlot.addr, path, body, pool.keyId);
         return { status: result.status, stream: result.stream, streamHeaders: result.headers };
       }
@@ -1267,15 +1790,13 @@ async function dispatch(
           console.warn(`[Dispatch] Upstream response: ${errBody.slice(0, 120)}`);
         }
       }
-      const fails = (proxyFailCount.get(selectedSlot.addr) || 0) + 1;
-      proxyFailCount.set(selectedSlot.addr, fails);
-      if (fails >= PROXY_MAX_FAILS) {
-        console.log(`[Dispatch] ${selectedSlot.addr} failed ${fails} consecutive times, marked unavailable`);
-        const bc = candidates.find(c => c.address === selectedSlot.addr);
-        if (bc) bc.lockedBy = '__blacklist__';
-      }
-      if (result.status === 429 || result.status >= 500) {
+      rememberRetryAfter(selectedSlot.addr, result.headers);
+      const verdict = noteExitFailure(selectedSlot.addr, result.status, dispatchModel);
+      if (verdict.startsWith('cooldown') || verdict.startsWith('evicted') || result.status >= 500) {
+        console.log(`[Dispatch] ${selectedSlot.addr} ${result.status} -> ${verdict}`);
         replaceFailedSlot(pool, selectedSlot.addr);
+      } else {
+        console.log(`[Dispatch] ${selectedSlot.addr} ${result.status} -> ${verdict}, exit stays in rotation`);
       }
       audit(result.status, latencyMs, selectedSlot.addr, path, errBody, pool.keyId);
       // If proxy returned "Model is unavailable" (datacenter proxy geoblocked), try direct fallback
@@ -1297,10 +1818,9 @@ async function dispatch(
       if (result.status >= 200 && result.status < 400) {
         stats.total++;
         stats.success++;
-        const usage = extractUsageFromResponse(result.body);
-        if (usage.tokens > 0) recordKeyUsage(pool.keyId, usage.tokens);
         console.log(`[Dispatch] ${selectedSlot.addr} OK ${result.status} (${latencyMs}ms) pool=${pool.keyId.slice(0,7)}...`);
-        proxyFailCount.delete(selectedSlot.addr);
+        rememberRetryAfter(selectedSlot.addr, result.headers);
+        noteExitSuccess(selectedSlot.addr, dispatchModel);
         audit(result.status, latencyMs, selectedSlot.addr, path, result.body, pool.keyId);
         return { status: result.status, body: result.body };
       }
@@ -1308,15 +1828,13 @@ async function dispatch(
       if (result.status === 429) stats.rateLimited++;
       else stats.errors++;
       console.error(`[Dispatch] ${selectedSlot.addr} ${result.status} (${latencyMs}ms) retry=${retry}`);
-      const fails = (proxyFailCount.get(selectedSlot.addr) || 0) + 1;
-      proxyFailCount.set(selectedSlot.addr, fails);
-      if (fails >= PROXY_MAX_FAILS) {
-        console.log(`[Dispatch] ${selectedSlot.addr} failed ${fails} consecutive times, marked unavailable`);
-        const bc = candidates.find(c => c.address === selectedSlot.addr);
-        if (bc) bc.lockedBy = '__blacklist__';
-      }
-      if (result.status === 429 || result.status >= 500) {
+      rememberRetryAfter(selectedSlot.addr, result.headers);
+      const verdict = noteExitFailure(selectedSlot.addr, result.status, dispatchModel);
+      if (verdict.startsWith('cooldown') || verdict.startsWith('evicted') || result.status >= 500) {
+        console.log(`[Dispatch] ${selectedSlot.addr} ${result.status} -> ${verdict}`);
         replaceFailedSlot(pool, selectedSlot.addr);
+      } else {
+        console.log(`[Dispatch] ${selectedSlot.addr} ${result.status} -> ${verdict}, exit stays in rotation`);
       }
       audit(result.status, latencyMs, selectedSlot.addr, path, result.body, pool.keyId);
       // If proxy returned "Model is unavailable", try direct fallback
@@ -1337,13 +1855,8 @@ async function dispatch(
     stats.total++;
     stats.errors++;
     console.error(`[Dispatch] ${selectedSlot.addr} exception: ${e.message} retry=${retry}`);
-    const fails = (proxyFailCount.get(selectedSlot.addr) || 0) + 1;
-    proxyFailCount.set(selectedSlot.addr, fails);
-    if (fails >= PROXY_MAX_FAILS) {
-      console.log(`[Dispatch] ${selectedSlot.addr} failed ${fails} consecutive exceptions, marked unavailable`);
-      const bc = candidates.find(c => c.address === selectedSlot.addr);
-      if (bc) bc.lockedBy = '__blacklist__';
-    }
+    const verdict = noteExitFailure(selectedSlot.addr, 0, dispatchModel);
+    console.log(`[Dispatch] ${selectedSlot.addr} transport exception -> ${verdict}`);
     replaceFailedSlot(pool, selectedSlot.addr);
     audit(502, Date.now() - start, selectedSlot.addr, path, JSON.stringify({ error: e.message }), pool.keyId);
     if (retry < MAX_RETRIES) {
@@ -1431,7 +1944,7 @@ function collectHeadersFromReq(nodeReq: http.IncomingMessage, bodyStr?: string):
   }
   h['authorization'] = 'Bearer public';
   h['x-opencode-client'] = 'cli';
-  h['user-agent'] = 'opencode/1.18.16 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14';
+  h['user-agent'] = 'opencode/1.18.33 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14';
   if (!h['content-type']) h['content-type'] = 'application/json';
 
   // Session: prefer client-provided, otherwise derive stableID from conversation seed
@@ -1448,7 +1961,12 @@ function collectHeadersFromReq(nodeReq: http.IncomingMessage, bodyStr?: string):
   }
   if (!sessionSignal && bodyStr) sessionSignal = conversationSeed(bodyStr);
   if (!sessionSignal || sessionSignal === '{}') sessionSignal = randomID('fallback', 16);
-  if (!h['x-opencode-session']) h['x-opencode-session'] = stableID('ses', sessionSignal);
+  // The session id must be in OpenCode's canonical shape or the anonymous lane
+  // answers 403, so a client-supplied id is normalised too rather than trusted
+  // as-is. Deriving from the same seed keeps prompt-cache affinity stable.
+  h['x-opencode-session'] = FREE_TIER_AGENT_SHAPE
+    ? canonicalSessionID(sessionSignal)
+    : stableID('ses', sessionSignal);
 
   // Request: unique per request
   if (!h['x-opencode-request']) h['x-opencode-request'] = randomID('req', 16);
@@ -1485,6 +2003,250 @@ function sendJson(nodeRes: http.ServerResponse, status: number, data: any) {
   nodeRes.end(body);
 }
 
+// Reassemble an OpenAI chat SSE stream into a single chat.completion object,
+// so a caller that asked for a non-streaming response still gets one even
+// though the upstream request had to be agent-shaped (stream: true).
+async function collectChatStream(
+  stream: ReadableStream<Uint8Array>,
+  fallbackModel: string,
+): Promise<{ status: number; body: string }> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let text = '';
+  let model = fallbackModel;
+  let id = '';
+  let created = 0;
+  let finishReason = 'stop';
+  let promptTokens = 0, completionTokens = 0, totalTokens = 0;
+
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) buffer += decoder.decode(value, { stream: true });
+      // SSE events are separated by a blank line; keep the last partial one.
+      const events = buffer.split(/\r?\n\r?\n/);
+      buffer = events.pop() || '';
+      for (const raw of events) {
+        for (const line of raw.split(/\r?\n/)) {
+          if (!line.startsWith('data:')) continue;
+          const data = line.slice(5).trim();
+          if (!data || data === '[DONE]') continue;
+          let evt: any;
+          try { evt = JSON.parse(data); } catch { continue; }
+          if (evt.error) {
+            return {
+              status: 502,
+              body: JSON.stringify({ error: { message: evt.error.message || 'upstream stream error', type: 'upstream_error' } }),
+            };
+          }
+          if (evt.id) id = evt.id;
+          if (evt.model) model = evt.model;
+          if (evt.created) created = evt.created;
+          const delta = evt.choices?.[0]?.delta;
+          if (typeof delta?.content === 'string') text += delta.content;
+          if (evt.choices?.[0]?.finish_reason) finishReason = evt.choices?.[0]?.finish_reason;
+          const u = evt.usage;
+          if (u) {
+            promptTokens = u.prompt_tokens ?? promptTokens;
+            completionTokens = u.completion_tokens ?? completionTokens;
+            totalTokens = u.total_tokens ?? totalTokens;
+          }
+        }
+      }
+    }
+  } catch (e: any) {
+    return { status: 502, body: JSON.stringify({ error: { message: e?.message || 'stream read failed' } }) };
+  }
+
+  if (!text && totalTokens === 0) {
+    return { status: 502, body: JSON.stringify({ error: { message: 'upstream produced no content' } }) };
+  }
+  return {
+    status: 200,
+    body: JSON.stringify({
+      id: id || 'chatcmpl-opencode2api',
+      object: 'chat.completion',
+      created: created || Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: finishReason }],
+      usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens },
+    }),
+  };
+}
+
+// ── Responses-only models ──
+// These moved off /chat/completions upstream and answer with a bare
+// 500 "Internal server error" there, while /v1/responses serves them normally.
+// Same-key repro is documented upstream (opencode #44659, #44847, #45744) and
+// in FishBottle7/opencode2dsh#7. Callers keep speaking OpenAI chat to us; the
+// translation to Responses happens here and the reply is translated back.
+const RESPONSES_ONLY_MODELS = new Set([
+  'muse-spark-1.2-contributor',
+  'muse-spark-1.2-contributor-free',
+  'muse-spark-1.3-contributor',
+  'muse-spark-1.3-contributor-free',
+]);
+
+function isResponsesOnlyModel(model: string | undefined): boolean {
+  if (!model) return false;
+  return RESPONSES_ONLY_MODELS.has(model) || RESPONSES_ONLY_MODELS.has(model.replace(/-free$/, ''));
+}
+
+// OpenAI chat body -> Responses body. Only the fields callers actually send are
+// carried across; anything unrecognised is dropped rather than passed through,
+// because the two schemas disagree about several names.
+function chatBodyToResponses(bodyStr: string): string | null {
+  let src: any;
+  try { src = JSON.parse(bodyStr); } catch { return null; }
+  if (!src || typeof src !== 'object' || Array.isArray(src)) return null;
+
+  const input: any[] = [];
+  const messages: any[] = Array.isArray(src.messages) ? src.messages : [];
+  for (const m of messages) {
+    if (!m || typeof m !== 'object') continue;
+    const role = m.role;
+    // Chat carries the system prompt as `system`; Responses expects it as a
+    // `developer` turn inside the input array.
+    const mapped = role === 'system' || role === 'developer' ? 'developer' : role;
+    if (typeof m.content === 'string') {
+      input.push({ role: mapped, content: m.content });
+    } else if (Array.isArray(m.content)) {
+      const parts = m.content
+        .map((p: any) => {
+          if (typeof p === 'string') return { type: 'input_text', text: p };
+          if (p?.type === 'text') return { type: 'input_text', text: p.text };
+          if (p?.type === 'image_url') {
+            return { type: 'input_image', image_url: p.image_url?.url };
+          }
+          return null;
+        })
+        .filter(Boolean);
+      if (parts.length) input.push({ role: mapped, content: parts });
+    }
+  }
+  if (!input.length) return null;
+
+  const out: any = {
+    model: src.model,
+    input,
+    stream: true,                       // the anonymous lane rejects stream:false
+    store: false,
+  };
+  if (src.max_tokens != null) out.max_output_tokens = src.max_tokens;
+  else if (src.max_completion_tokens != null) out.max_output_tokens = src.max_completion_tokens;
+  // The Responses endpoint rejects anything below 16, and a probe or a terse
+  // caller can easily ask for less, so clamp rather than forward a 400.
+  if (out.max_output_tokens != null && out.max_output_tokens < 16) out.max_output_tokens = 16;
+  if (Array.isArray(src.tools) && src.tools.length) {
+    out.tools = src.tools.map((t: any) => (
+      t?.type === 'function' && t.function
+        ? { type: 'function', name: t.function.name, description: t.function.description, parameters: t.function.parameters }
+        : t
+    ));
+  }
+  if (!out.tools || !out.tools.length) out.tools = freeTierStubToolset(FREE_TIER_CORE_TOOLS);
+  if (src.tool_choice) out.tool_choice = src.tool_choice;
+  if (src.reasoning_effort) out.reasoning = { effort: src.reasoning_effort };
+  if (src.temperature != null) out.temperature = src.temperature;
+  if (src.top_p != null) out.top_p = src.top_p;
+  return JSON.stringify(out);
+}
+
+// Responses SSE -> OpenAI chat SSE, so everything downstream in this gateway
+// (stream piping, usage accounting, the non-streaming reassembler) keeps
+// working on one shape.
+function responsesSseToChatSse(
+  upstream: ReadableStream<Uint8Array>,
+  fallbackModel: string,
+): ReadableStream<Uint8Array> {
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buffer = '';
+  let model = fallbackModel;
+  let responseId = '';
+  let created = 0;
+  let sentRole = false;
+  let sentFinish = false;
+
+  const chunk = (delta: any, finish: string | null, usage?: any) => JSON.stringify({
+    id: responseId || 'chatcmpl-opencode2api',
+    object: 'chat.completion.chunk',
+    created: created || Math.floor(Date.now() / 1000),
+    model,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+    ...(usage ? { usage } : {}),
+  });
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const emit = (obj: string) => controller.enqueue(encoder.encode(`data: ${obj}\n\n`));
+      const handle = (evt: any) => {
+        const type = evt?.type;
+        if (type === 'response.created' || type === 'response.in_progress') {
+          const r = evt.response || {};
+          if (r.id) responseId = r.id;
+          if (r.model) model = r.model;
+          if (r.created_at) created = r.created_at;
+          return;
+        }
+        if (type === 'response.output_text.delta') {
+          if (!sentRole) { sentRole = true; emit(chunk({ role: 'assistant', content: '' }, null)); }
+          if (typeof evt.delta === 'string' && evt.delta) emit(chunk({ content: evt.delta }, null));
+          return;
+        }
+        if (type === 'response.completed' || type === 'response.incomplete') {
+          if (!sentRole) { sentRole = true; emit(chunk({ role: 'assistant', content: '' }, null)); }
+          if (sentFinish) return;
+          sentFinish = true;
+          const u = evt.response?.usage;
+          const usage = u ? {
+            prompt_tokens: u.input_tokens ?? 0,
+            completion_tokens: u.output_tokens ?? 0,
+            total_tokens: u.total_tokens ?? ((u.input_tokens ?? 0) + (u.output_tokens ?? 0)),
+          } : undefined;
+          emit(chunk({}, 'stop', usage));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        }
+      };
+
+      const reader = upstream.getReader();
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) buffer += decoder.decode(value, { stream: true });
+          const events = buffer.split(/\r?\n\r?\n/);
+          buffer = events.pop() || '';
+          for (const raw of events) {
+            for (const line of raw.split(/\r?\n/)) {
+              if (!line.startsWith('data:')) continue;
+              const data = line.slice(5).trim();
+              if (!data || data === '[DONE]') continue;
+              try { handle(JSON.parse(data)); } catch {}
+            }
+          }
+          if (sentFinish) { try { await reader.cancel(); } catch {} return; }
+        }
+      } catch (e: any) {
+        try {
+          emit(JSON.stringify({ error: { message: e?.message || 'responses stream failed' } }));
+        } catch {}
+      } finally {
+        if (!sentFinish) {
+          sentFinish = true;
+          try { emit(chunk({}, 'stop')); } catch {}
+          try { controller.enqueue(encoder.encode('data: [DONE]\n\n')); } catch {}
+        }
+        try { controller.close(); } catch {}
+      }
+    },
+    cancel(reason) { /* upstream reader is cancelled by the loop above */ },
+  });
+}
+
 function sendCors(nodeRes: http.ServerResponse) {
   nodeRes.writeHead(204, {
     'access-control-allow-origin': '*',
@@ -1492,6 +2254,395 @@ function sendCors(nodeRes: http.ServerResponse) {
     'access-control-allow-headers': 'content-type, authorization',
   });
   nodeRes.end();
+}
+
+// The server binds every interface, so /api/keys — which hands out the very
+// credentials callers use to reach the upstream — cannot stay open. Gate it on
+// the admin key. Compared in constant time so the check does not leak the key
+// through response timing.
+function requireAdmin(nodeReq: http.IncomingMessage, nodeRes: http.ServerResponse): boolean {
+  const presented = String(nodeReq.headers['authorization'] || '').replace(/^Bearer\s+/i, '');
+  const a = Buffer.from(presented);
+  const b = Buffer.from(API_KEY);
+  const ok = a.length === b.length && crypto.timingSafeEqual(a, b);
+  if (!ok) {
+    sendJson(nodeRes, 401, { error: 'unauthorized', message: 'Admin key required' });
+  }
+  return ok;
+}
+
+function fetchJsonDirect(url: string, timeoutMs: number): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, {
+      method: 'GET',
+      headers: { accept: 'application/json', 'user-agent': 'opencode2api' },
+      rejectUnauthorized: false,
+      timeout: timeoutMs,
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
+        } catch (e: any) {
+          reject(new Error(`bad-json: ${e?.message || e}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    req.end();
+  });
+}
+
+async function fetchModelsDevFreeIds(): Promise<Set<string> | null> {
+  if (modelsDevFreeIds && Date.now() - modelsDevTime < MODELS_DEV_TTL_MS) {
+    return modelsDevFreeIds;
+  }
+  const doc: any = await fetchJsonDirect(MODELS_DEV_URL, 10000);
+  const models = doc?.opencode?.models || {};
+  const free = new Set<string>();
+  for (const [id, m] of Object.entries<any>(models)) {
+    const cost = (m as any)?.cost;
+    if (cost && cost.input === 0 && cost.output === 0) free.add(id);
+  }
+  modelsDevFreeIds = free;
+  modelsDevTime = Date.now();
+  return free;
+}
+
+function isFreeBySuffix(id: string): boolean {
+  return id.endsWith('-free') || id === 'big-pickle';
+}
+
+
+async function fetchModelsFromUpstream(): Promise<any[]> {
+  let agent: https.Agent | undefined;
+  if (warpSlot) {
+    agent = new SocksProxyAgent(warpSlot.url, { timeout: 10000 }) as unknown as https.Agent;
+  }
+  const result = await new Promise<any>((resolve, reject) => {
+    const req = https.request(`${UPSTREAM}/v1/models`, {
+      method: 'GET',
+      headers: {
+        accept: 'application/json',
+        authorization: 'Bearer public',
+        'x-opencode-client': 'desktop',
+        'x-opencode-session': canonicalSessionID(`models-${Date.now()}`),
+        'user-agent': 'opencode',
+      },
+      agent,
+      rejectUnauthorized: false,
+      timeout: 10000,
+    }, (res) => {
+      const chunks: Buffer[] = [];
+      res.on('data', (c: Buffer) => chunks.push(c));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
+        } catch {
+          resolve({ data: [] });
+        }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    req.end();
+  });
+  const upstreamList: any[] = result.data || [];
+  let freeModels: any[];
+  try {
+    const freeSet = await fetchModelsDevFreeIds();
+    if (freeSet) {
+      freeModels = upstreamList.filter((m: any) => m.id && freeSet.has(m.id));
+    } else {
+      freeModels = upstreamList.filter((m: any) => m.id && isFreeBySuffix(String(m.id)));
+    }
+  } catch (e: any) {
+    console.warn(`[Models] models.dev lookup failed, suffix fallback: ${e?.message || e}`);
+    freeModels = upstreamList.filter((m: any) => m.id && isFreeBySuffix(String(m.id)));
+  }
+  // Add convenient aliases if target model is present
+  const aliasMap: Record<string, string> = {
+    'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
+    'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
+  };
+  for (const [aliasId, canonicalId] of Object.entries(aliasMap)) {
+    const target = freeModels.find((m: any) => m.id === canonicalId);
+    if (target && !freeModels.some((m: any) => m.id === aliasId)) {
+      freeModels.push({
+        id: aliasId,
+        object: 'model',
+        created: target.created,
+        owned_by: target.owned_by || 'opencode',
+      });
+    }
+  }
+
+  cachedModels = freeModels;
+  cachedModelsTime = Date.now();
+  return freeModels;
+}
+
+// Cheapest possible call that still exercises the real path: one token, no
+// proxy, so reachability is measured without spending a slot or compounding
+// upstream rate limits. Aliases resolve to their canonical ID first, otherwise
+// an alias is probed as a model that does not exist upstream.
+function resolveAliasId(model: string): string {
+  const ALIAS: Record<string, string> = {
+    'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
+    'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
+  };
+  return ALIAS[model] || model;
+}
+
+async function probeFreeModel(model: string): Promise<ModelHealth> {
+  const prev = freeModelHealth.get(model);
+  const target = resolveAliasId(model);
+  let status = 0;
+  let reason = '';
+  try {
+    const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const payload = (() => {
+        const base = {
+          model: target,
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 8,
+          stream: false,
+        };
+        // The probe must use the same shape as real traffic. A non-streaming,
+        // tool-less body is exactly what the anonymous lane answers 403, which
+        // would make every healthy model look dead and withhold it.
+        if (!FREE_TIER_AGENT_SHAPE) return JSON.stringify(base);
+        // Responses-only models must be probed on the endpoint that serves
+        // them, or the probe sees the same bare 500 real callers would.
+        if (isResponsesOnlyModel(target)) {
+          return JSON.stringify({
+            model: target,
+            input: [{ role: 'user', content: 'hi' }],
+            max_output_tokens: 16,
+            stream: true,
+            store: false,
+            tools: freeTierStubToolset(FREE_TIER_CORE_TOOLS).map((t: any) => ({
+              type: 'function', name: t.function.name,
+              description: t.function.description, parameters: t.function.parameters,
+            })),
+          });
+        }
+        return JSON.stringify({
+          ...base,
+          stream: true,
+          stream_options: { include_usage: true },
+          tools: freeTierStubToolset(FREE_TIER_CORE_TOOLS),
+        });
+      })();
+      const probePath = isResponsesOnlyModel(target) ? '/v1/responses' : '/v1/chat/completions';
+      const req = https.request(`${UPSTREAM}${probePath}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json',
+          authorization: 'Bearer public',
+          'x-opencode-client': 'cli',
+          'x-opencode-session': canonicalSessionID(`probe-${model}`),
+          'x-opencode-request': randomID('probe', 8),
+          'x-opencode-project': 'opencode2api',
+          'user-agent': 'opencode/1.18.33 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14',
+          'content-length': Buffer.byteLength(payload),
+        },
+        rejectUnauthorized: false,
+        timeout: 20000,
+      }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => resolve({
+          status: res.statusCode || 0,
+          body: Buffer.concat(chunks).toString('utf-8'),
+        }));
+      });
+      req.on('error', reject);
+      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+      req.end(payload);
+    });
+    status = result.status;
+    if (status >= 200 && status < 400) {
+      reason = 'ok';
+    } else {
+      try {
+        const doc: any = JSON.parse(result.body);
+        reason = doc?.error?.message || doc?.message || `HTTP ${status}`;
+      } catch {
+        reason = `HTTP ${status}`;
+      }
+    }
+  } catch (e: any) {
+    status = 0;
+    reason = e?.message || String(e);
+  }
+
+  let health: ModelHealth;
+  if (status >= 200 && status < 400) {
+    health = { verdict: 'healthy', status, reason: 'ok', consecutiveFails: 0, checkedAt: Date.now() };
+  } else if (isTransientStatus(status)) {
+    // Keep whatever verdict we had; a blip must not blacklist a working model.
+    health = {
+      verdict: prev && prev.verdict !== 'unknown' ? prev.verdict : 'unknown',
+      status, reason: reason || `HTTP ${status}`,
+      consecutiveFails: prev?.consecutiveFails || 0,
+      checkedAt: Date.now(),
+    };
+  } else if (isHardFailure(status)) {
+    health = { verdict: 'dead', status, reason: reason || `HTTP ${status}`, consecutiveFails: prev?.consecutiveFails || 0, checkedAt: Date.now() };
+  } else {
+    // Ambiguous failure (5xx and friends). Count it, but require repeats before
+    // calling it dead so a single upstream hiccup does not withdraw a model.
+    const fails = (prev?.consecutiveFails || 0) + 1;
+    health = {
+      verdict: fails >= MODEL_DEAD_AFTER_FAILS ? 'dead' : (prev?.verdict === 'dead' ? 'dead' : 'unknown'),
+      status, reason: reason || `HTTP ${status}`,
+      consecutiveFails: fails,
+      checkedAt: Date.now(),
+    };
+  }
+  freeModelHealth.set(model, health);
+  return health;
+}
+
+async function verifyFreeModels(): Promise<void> {
+  if (verifyingModels) return;
+  verifyingModels = true;
+  try {
+    const ids = cachedModels.map(m => m.id).filter(Boolean);
+    for (let i = 0; i < ids.length; i += MODEL_VERIFY_CONCURRENCY) {
+      await Promise.all(ids.slice(i, i + MODEL_VERIFY_CONCURRENCY).map(probeFreeModel));
+    }
+    // One retry for probes that learned nothing (timeout / 429 / no verdict).
+    // Cheap, and it stops a transient blip from leaving a healthy model
+    // unclassified until the next 30-minute interval.
+    const inconclusive = ids.filter(id => {
+      const h = freeModelHealth.get(id);
+      return !h || h.verdict === 'unknown';
+    });
+    if (inconclusive.length) {
+      console.log(`[Models] retrying ${inconclusive.length} inconclusive probe(s)`);
+      for (let i = 0; i < inconclusive.length; i += MODEL_VERIFY_CONCURRENCY) {
+        await Promise.all(inconclusive.slice(i, i + MODEL_VERIFY_CONCURRENCY).map(probeFreeModel));
+      }
+    }
+    modelsVerified = true;
+    const verdict = (id: string) => freeModelHealth.get(id)?.verdict || 'unknown';
+    const healthy = ids.filter(id => verdict(id) === 'healthy');
+    const dead = ids.filter(id => verdict(id) === 'dead');
+    const unknown = ids.filter(id => verdict(id) === 'unknown');
+    const detail = (ids: string[]) => ids.map(id => {
+      const h = freeModelHealth.get(id);
+      return `${id} [${h?.status ?? '?'} ${(h?.reason || 'no reason').slice(0, 48)}]`;
+    });
+    console.log(`[Models] Probed ${ids.length} free models: ${healthy.length} callable, ${dead.length} dead, ${unknown.length} unconfirmed`);
+    if (dead.length) console.log(`[Models]   dead: ${detail(dead).join('; ')}`);
+    if (unknown.length) console.log(`[Models]   unconfirmed (needs ${MODEL_DEAD_AFTER_FAILS} consecutive failures to be withdrawn): ${detail(unknown).join('; ')}`);
+    if (!healthy.length) console.warn(`[Models] No free model verified callable; requests for dead models cannot be rerouted.`);
+  } catch (e: any) {
+    console.warn(`[Models] verification pass failed: ${e?.message || e}`);
+  } finally {
+    verifyingModels = false;
+  }
+}
+
+// Models safe to send real traffic to.
+//
+// A model is withheld only on a *definitive* upstream rejection: 4xx goes
+// straight to 'dead', and 5xx needs MODEL_DEAD_AFTER_FAILS consecutive strikes.
+// An inconclusive probe (network timeout, 408/425/429) carries no information
+// about the model, so it must not withdraw one — treating "unknown" as
+// "unusable" made a working model disappear from /v1/models because a single
+// probe timed out, and it also counted unknown models as callable in the
+// progress log. Unconfirmed models stay advertised and are labelled as such in
+// /api/models so the dashboard can show the difference.
+function workingFreeModelIds(): string[] {
+  const ids = cachedModels.map(m => m.id).filter(Boolean);
+  if (!modelsVerified && freeModelHealth.size === 0) return ids;
+  return ids.filter(id => freeModelHealth.get(id)?.verdict !== 'dead');
+}
+
+function pickWorkingModel(): string | null {
+  // verification pass it contains only confirmed-healthy models, and before one
+  // it falls back to the upstream list. Either way the first entry is the best
+  // available substitute.
+  return workingFreeModelIds()[0] || null;
+}
+
+// Side-channel for the dashboard: which IDs are actually callable and why the
+// rest are not. The model list itself stays complete so the UI can show
+// withdrawn models as disabled entries instead of hiding the fact they exist.
+function modelAvailability(): { callableIds: string[]; withheld: { id: string; verdict: ModelVerdict; status: number; reason: string }[] } {
+  const ids = cachedModels.map(m => m.id).filter(Boolean);
+  const callable = new Set(workingFreeModelIds());
+  return {
+    callableIds: ids.filter(id => callable.has(id)),
+    withheld: ids
+      .filter(id => !callable.has(id))
+      .map(id => {
+        const h = freeModelHealth.get(id);
+        return {
+          id,
+          verdict: h?.verdict || 'unknown',
+          status: h?.status ?? 0,
+          reason: h?.reason || (modelsVerified ? 'not verified callable' : 'not checked yet'),
+        };
+      }),
+  };
+}
+
+// Accept stripped and common aliases (e.g. `mimo-v2.5` → `mimo-v2.5-free`, `muse-spark-1.3-free` → `muse-spark-1.3-contributor-free`).
+// Never rewrites `big-pickle` or paid models.
+// Also injects stream_options.include_usage on streamed requests so usage
+// comes back in the SSE trailer (opencodex openai-chat.ts does the same);
+// otherwise streamed calls never record token counts.
+// Also routes around models verified dead: a caller asking for one gets a
+// working free model instead of the upstream's raw 400/403/500, and the swap is
+// reported on the response so it is never silent.
+function normalizeFreeModelAlias(bodyStr: string | undefined): { body?: string; substitutedFrom?: string; substitutedTo?: string } {
+  if (!bodyStr) return { body: bodyStr };
+  try {
+    bodyStr = patchMissingReasoningContent(bodyStr);
+    const parsed = JSON.parse(bodyStr);
+    const model = parsed?.model;
+    let substitutedFrom: string | undefined;
+    let substitutedTo: string | undefined;
+    if (typeof model === 'string' && model) {
+      const KNOWN_EXPLICIT_ALIASES: Record<string, string> = {
+        'muse-spark-1.3': 'muse-spark-1.3-contributor-free',
+        'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
+        'muse-spark-1.2': 'muse-spark-1.2-contributor-free',
+        'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
+        'ling-3.0-flash-fin': 'ling-3.0-flash-fin-free',
+      };
+      if (KNOWN_EXPLICIT_ALIASES[model]) {
+        parsed.model = KNOWN_EXPLICIT_ALIASES[model];
+      } else if (model !== 'big-pickle' && !model.endsWith('-free')) {
+        const want = `${model}-free`;
+        if (cachedModels.some((m: any) => m.id === want)) parsed.model = want;
+      }
+      // Dead-model routing, applied after alias resolution so the verdict is
+      // looked up under the canonical ID.
+      const resolved = String(parsed.model);
+      if (freeModelHealth.get(resolved)?.verdict === 'dead') {
+        const replacement = pickWorkingModel();
+        if (replacement && replacement !== resolved) {
+          substitutedFrom = resolved;
+          substitutedTo = replacement;
+          parsed.model = replacement;
+        }
+      }
+    }
+    if (parsed?.stream === true && parsed.stream_options === undefined) {
+      parsed.stream_options = { include_usage: true };
+    }
+    return { body: JSON.stringify(parsed), substitutedFrom, substitutedTo };
+  } catch {
+    return { body: bodyStr };
+  }
 }
 
 const server = http.createServer(async (nodeReq, nodeRes) => {
@@ -1654,170 +2805,24 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
   // opencodex rule (`-free` suffix or `big-pickle`) when models.dev is
   // unreachable. Advertised IDs keep their upstream-original form so they
   // stay callable; stripped aliases are normalized on the chat path below.
-function fetchJsonDirect(url: string, timeoutMs: number): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const req = https.request(url, {
-      method: 'GET',
-      headers: { accept: 'application/json', 'user-agent': 'zengate' },
-      rejectUnauthorized: false,
-      timeout: timeoutMs,
-    }, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
-        } catch (e: any) {
-          reject(new Error(`bad-json: ${e?.message || e}`));
-        }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-    req.end();
-  });
-}
-
-async function fetchModelsDevFreeIds(): Promise<Set<string> | null> {
-  if (modelsDevFreeIds && Date.now() - modelsDevTime < MODELS_DEV_TTL_MS) {
-    return modelsDevFreeIds;
-  }
-  const doc: any = await fetchJsonDirect(MODELS_DEV_URL, 10000);
-  const models = doc?.opencode?.models || {};
-  const free = new Set<string>();
-  for (const [id, m] of Object.entries<any>(models)) {
-    const cost = (m as any)?.cost;
-    if (cost && cost.input === 0 && cost.output === 0) free.add(id);
-  }
-  modelsDevFreeIds = free;
-  modelsDevTime = Date.now();
-  return free;
-}
-
-function isFreeBySuffix(id: string): boolean {
-  return id.endsWith('-free') || id === 'big-pickle';
-}
-
-async function fetchModelsFromUpstream(): Promise<any[]> {
-  let agent: https.Agent | undefined;
-  if (warpSlot) {
-    agent = new SocksProxyAgent(warpSlot.url, { timeout: 10000 }) as unknown as https.Agent;
-  }
-  const result = await new Promise<any>((resolve, reject) => {
-    const req = https.request(`${UPSTREAM}/v1/models`, {
-      method: 'GET',
-      headers: {
-        accept: 'application/json',
-        authorization: 'Bearer public',
-        'x-opencode-client': 'desktop',
-        'x-opencode-session': crypto.randomUUID(),
-        'user-agent': 'opencode',
-      },
-      agent,
-      rejectUnauthorized: false,
-      timeout: 10000,
-    }, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
-        } catch {
-          resolve({ data: [] });
-        }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-    req.end();
-  });
-  const upstreamList: any[] = result.data || [];
-  let freeModels: any[];
-  try {
-    const freeSet = await fetchModelsDevFreeIds();
-    if (freeSet) {
-      freeModels = upstreamList.filter((m: any) => m.id && freeSet.has(m.id));
-    } else {
-      freeModels = upstreamList.filter((m: any) => m.id && isFreeBySuffix(String(m.id)));
-    }
-  } catch (e: any) {
-    console.warn(`[Models] models.dev lookup failed, suffix fallback: ${e?.message || e}`);
-    freeModels = upstreamList.filter((m: any) => m.id && isFreeBySuffix(String(m.id)));
-  }
-  // Add convenient aliases if target model is present
-  const aliasMap: Record<string, string> = {
-    'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
-    'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
-  };
-  for (const [aliasId, canonicalId] of Object.entries(aliasMap)) {
-    const target = freeModels.find((m: any) => m.id === canonicalId);
-    if (target && !freeModels.some((m: any) => m.id === aliasId)) {
-      freeModels.push({
-        id: aliasId,
-        object: 'model',
-        created: target.created,
-        owned_by: target.owned_by || 'opencode',
-      });
-    }
-  }
-
-  cachedModels = freeModels;
-  cachedModelsTime = Date.now();
-  return freeModels;
-}
-
-// Accept stripped and common aliases (e.g. `mimo-v2.5` → `mimo-v2.5-free`, `muse-spark-1.3-free` → `muse-spark-1.3-contributor-free`).
-// Never rewrites `big-pickle` or paid models.
-// Also injects stream_options.include_usage on streamed requests so usage
-// comes back in the SSE trailer (opencodex openai-chat.ts does the same);
-// otherwise streamed calls never record token counts.
-function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefined {
-  if (!bodyStr) return bodyStr;
-  try {
-    bodyStr = patchMissingReasoningContent(bodyStr);
-    const parsed = JSON.parse(bodyStr);
-    const model = parsed?.model;
-    if (typeof model === 'string' && model) {
-      const KNOWN_EXPLICIT_ALIASES: Record<string, string> = {
-        'muse-spark-1.3': 'muse-spark-1.3-contributor-free',
-        'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
-        'muse-spark-1.2': 'muse-spark-1.2-contributor-free',
-        'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
-        'ling-3.0-flash-fin': 'ling-3.0-flash-fin-free',
-      };
-      if (KNOWN_EXPLICIT_ALIASES[model]) {
-        parsed.model = KNOWN_EXPLICIT_ALIASES[model];
-      } else if (model !== 'big-pickle' && !model.endsWith('-free')) {
-        const want = `${model}-free`;
-        if (cachedModels.some((m: any) => m.id === want)) parsed.model = want;
-      }
-    }
-    if (parsed?.stream === true && parsed.stream_options === undefined) {
-      parsed.stream_options = { include_usage: true };
-    }
-    return JSON.stringify(parsed);
-  } catch {
-    return bodyStr;
-  }
-}
-
 // –– API: Models ––
   if (pathname === '/api/models' && method === 'GET') {
     try {
       if (cachedModels.length > 0 && Date.now() - cachedModelsTime < 300000) {
-        sendJson(nodeRes, 200, { models: cachedModels });
+        sendJson(nodeRes, 200, { models: cachedModels, ...modelAvailability() });
         return;
       }
       const freeModels = await fetchModelsFromUpstream();
-      sendJson(nodeRes, 200, { models: freeModels });
+      sendJson(nodeRes, 200, { models: freeModels, ...modelAvailability() });
     } catch (e: any) {
       sendJson(nodeRes, 502, { error: e.message });
     }
     return;
   }
 
-  // –– API: Key Management ––
+  // –– API: Key Management (admin only) ––
   if (pathname === '/api/keys' && method === 'GET') {
+    if (!requireAdmin(nodeReq, nodeRes)) return;
     const keys = Object.values(apiKeys).map(r => ({
       key: r.key.slice(0, 7) + '...' + r.key.slice(-4),
       fullKey: r.key,
@@ -1838,6 +2843,7 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
 
   // POST /api/keys — Create new Key
   if (pathname === '/api/keys' && method === 'POST') {
+    if (!requireAdmin(nodeReq, nodeRes)) return;
     try {
       const body = JSON.parse(await readBody(nodeReq));
       const newKey = body.key || crypto.randomBytes(24).toString('hex');
@@ -1869,6 +2875,9 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
   // PUT /api/keys/:key — Update Key
   const putMatch = pathname.match(/^\/api\/keys\/(.+)$/);
   if (putMatch && method === 'PUT') {
+    // Authenticate before the existence check, otherwise a 404-vs-401 split
+    // lets an unauthenticated caller enumerate which keys exist.
+    if (!requireAdmin(nodeReq, nodeRes)) return;
     const targetKey = putMatch[1];
     const record = apiKeys[targetKey];
     if (!record) {
@@ -1898,6 +2907,7 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
 
   // DELETE /api/keys/:key — Delete Key
   if (putMatch && method === 'DELETE') {
+    if (!requireAdmin(nodeReq, nodeRes)) return;
     const targetKey = putMatch[1];
     if (!apiKeys[targetKey]) {
       sendJson(nodeRes, 404, { error: 'Key not found' });
@@ -1935,6 +2945,21 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
     } catch (e: any) {
       sendJson(nodeRes, 400, { error: e.message });
     }
+    return;
+  }
+
+  // –– API: Probe Standby (WARP + custom fallback proxies) ––
+  // The dashboard has called this since it was added; it had no route at all
+  // and every press returned 404.
+  if (pathname === '/api/standby/probe' && method === 'POST') {
+    const warpOk = warpModeRuntime === 'on' ? await probeWarp() : null;
+    const custom = await initCustomSlots();
+    sendJson(nodeRes, 200, {
+      ok: true,
+      warp: { enabled: warpModeRuntime === 'on', healthy: warpOk, status: warpStatus },
+      custom: { total: custom.length, healthy: custom.filter(c => c.ok).length, slots: custom },
+      readySlots: customSlots.length + (warpSlot ? 1 : 0),
+    });
     return;
   }
 
@@ -2055,13 +3080,38 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
 
   // –– API: Proxy Source List ––
   if (pathname === '/api/sources' && method === 'GET') {
-    const list = proxySources.map(s => ({
-      name: s.name,
-      type: s.type,
-      count: candidates.filter(c => !c.lockedBy).length,
-      error: null,
-    }));
-    sendJson(nodeRes, 200, { sources: list });
+    // Per-feed count and error from the last fetch. Reporting the pool-wide
+    // count and a hardcoded null error here made a timed-out feed
+    // indistinguishable from a healthy one.
+    const list = proxySources.map(s => {
+      const h = sourceHealth.get(s.name);
+      const breakerOpen = !!h && (h.openUntil || 0) > Date.now();
+      return {
+        name: s.name,
+        type: s.type,
+        count: h ? h.count : 0,
+        error: h ? h.error : 'not fetched yet',
+        fetchedAt: h ? h.fetchedAt : 0,
+        strikes: h?.strikes || 0,
+        breakerOpen,
+        retryInMs: breakerOpen ? (h!.openUntil - Date.now()) : 0,
+      };
+    });
+    const healthy = list.filter(s => s.error === null).length;
+    const cooling = list.filter(s => s.breakerOpen).length;
+    const now = Date.now();
+    const exitsCooling = [...exitHealth.values()].filter(h => h.cooldownUntil > now).length;
+    const pairsBanned = [...exitModelBans.values()]
+      .reduce((n, m) => n + [...m.values()].filter(b => b.bannedUntil > now).length, 0);
+    sendJson(nodeRes, 200, {
+      sources: list,
+      healthy,
+      total: list.length,
+      poolSize: candidates.filter(c => !c.lockedBy).length,
+      feedsInCooldown: cooling,
+      exitsInCooldown: exitsCooling,
+      exitModelBans: pairsBanned,
+    });
     return;
   }
 
@@ -2199,7 +3249,7 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
   // –– Proxy Forwarding (/v1/* | /openai/v1/*) ––
   if (pathname.startsWith('/v1/') || pathname.startsWith('/openai/v1/')) {
     // OpenAI compatible path → normalize to /v1/
-    const upstreamPath = pathname.replace(/^\/openai/, '');
+    let upstreamPath = pathname.replace(/^\/openai/, '');
     // Extract authorization Key
     const authHeader = nodeReq.headers['authorization'] || '';
     const authKey = authHeader.replace(/^Bearer\s+/i, '');
@@ -2217,21 +3267,77 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
     const startTime = Date.now();
 
     let bodyStr = method !== 'GET' && method !== 'HEAD' ? await readBody(nodeReq) : undefined;
+    let substitutedFrom: string | undefined;
+    let substitutedTo: string | undefined;
+    // Whether the caller asked for SSE. The agent shape forces stream:true
+    // upstream, so a non-streaming caller is served by reassembling the SSE
+    // back into a single JSON completion rather than being handed a stream.
+    let callerWantsStream = false;
     if (bodyStr && (upstreamPath.includes('/chat/completions') || upstreamPath.includes('/responses'))) {
-      bodyStr = normalizeFreeModelAlias(bodyStr);
+      const normalized = normalizeFreeModelAlias(bodyStr);
+      bodyStr = normalized.body;
+      substitutedFrom = normalized.substitutedFrom;
+      substitutedTo = normalized.substitutedTo;
+      if (substitutedFrom) {
+        console.log(`[Models] ${substitutedFrom} is dead upstream, serving ${substitutedTo} instead`);
+      }
+      const shaped = shapeAgentRequest(bodyStr as string);
+      bodyStr = shaped.body;
+      callerWantsStream = shaped.callerWantsStream;
+      if (shaped.reshaped) {
+        console.log(`[AgentShape] ${callerWantsStream ? 'kept' : 'upgraded to'} streaming for the anonymous Zen lane`);
+      }
+    }
+
+    // Models that upstream only serves over /v1/responses get rerouted there.
+    // The request is translated to Responses shape, and the reply is translated
+    // back to chat SSE, so callers keep using /v1/chat/completions unchanged.
+    let usedResponses = false;
+    let responsesFallbackModel = '';
+    if (bodyStr && upstreamPath.includes('/chat/completions')) {
+      let resolvedModel = '';
+      try { resolvedModel = (JSON.parse(bodyStr) as any)?.model || ''; } catch {}
+      if (isResponsesOnlyModel(resolvedModel)) {
+        const translated = chatBodyToResponses(bodyStr);
+        if (translated) {
+          usedResponses = true;
+          responsesFallbackModel = resolvedModel;
+          upstreamPath = upstreamPath.replace('/chat/completions', '/responses');
+          bodyStr = translated;
+          console.log(`[ResponsesRoute] ${resolvedModel} is Responses-only upstream, rerouting to /v1/responses`);
+        }
+      }
     }
     const reqHeaders = collectHeadersFromReq(nodeReq, bodyStr);
 
-    // Intercept /v1/models → return cached free models (no slot allocation needed)
+    // Intercept /v1/models → return cached free models (no slot allocation needed).
+    // Only models confirmed callable are advertised. Measured upstream: 11 of
+    // the 12 free IDs fail on a direct proxyless request (7× 403 tier lock,
+    // 1× 400 unavailable, 3× 500), so listing them as available is what made
+    // the pool look healthy and fail on first use.
     if (upstreamPath === '/v1/models' && method === 'GET') {
       try {
-        if (cachedModels.length > 0 && Date.now() - cachedModelsTime < 300000) {
-          sendJson(nodeRes, 200, { object: 'list', data: cachedModels });
-          releaseKey(authKey);
-          return;
+        let list = cachedModels;
+        if (list.length === 0 || Date.now() - cachedModelsTime >= 300000) {
+          list = await fetchModelsFromUpstream();
         }
-        const result = await fetchModelsFromUpstream();
-        sendJson(nodeRes, 200, { object: 'list', data: result });
+        const callables = workingFreeModelIds()
+          .map(id => list.find(m => m.id === id))
+          .filter(Boolean);
+        // Before the first verification pass there are no verdicts, so the full
+        // list is still the best answer available — do not filter on nothing.
+        const advertised = (modelsVerified || freeModelHealth.size > 0) ? callables : list;
+        const withheld = list
+          .filter(m => !advertised.some(a => a.id === m.id))
+          .map(m => {
+            const h = freeModelHealth.get(m.id);
+            return { id: m.id, status: h?.status ?? 0, reason: h?.reason || 'unverified' };
+          });
+        sendJson(nodeRes, 200, {
+          object: 'list',
+          data: advertised,
+          ...(withheld.length ? { withheld_unavailable: withheld } : {}),
+        });
         releaseKey(authKey);
         return;
       } catch (e: any) {
@@ -2254,7 +3360,35 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
 
       const result = await dispatch(upstreamPath + search, method, reqHeaders, bodyStr, pool);
 
+      // A Responses-only model asked for over /chat/completions is served by
+      // /v1/responses instead, then translated back into chat SSE so the
+      // caller's request shape is unchanged.
+      if (usedResponses && result.stream) {
+        result.stream = responsesSseToChatSse(result.stream, responsesFallbackModel);
+        result.streamHeaders = { ...(result.streamHeaders || {}), 'content-type': 'text/event-stream; charset=utf-8' };
+      }
+
       if (result.stream) {
+        // The agent shape forces stream:true upstream. When the caller asked
+        // for a single JSON completion, reassemble the SSE into one object
+        // rather than leaking an event stream to a non-streaming client.
+        if (!callerWantsStream) {
+          const requestedModel = (() => {
+            try { return (JSON.parse(bodyStr || '{}') as any)?.model || ''; } catch { return ''; }
+          })();
+          const collected = await collectChatStream(result.stream, substitutedTo || requestedModel);
+          const usage = extractUsageFromResponse(collected.body);
+          if (usage.tokens > 0) recordKeyUsage(authKey, usage.tokens);
+          nodeRes.writeHead(collected.status, {
+            'content-type': 'application/json',
+            'access-control-allow-origin': '*',
+            ...(substitutedTo
+              ? { 'x-opencode2api-substituted-model': `${substitutedFrom} -> ${substitutedTo}` }
+              : {}),
+          });
+          nodeRes.end(collected.body);
+          return;
+        }
         // Streaming response: clean hop-by-hop & conflicting headers from upstream
         const cleanHeaders: Record<string, string> = {};
         if (result.streamHeaders) {
@@ -2271,6 +3405,9 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
           'connection': 'keep-alive',
           'x-accel-buffering': 'no',
           'access-control-allow-origin': '*',
+          ...(substitutedTo
+            ? { 'x-opencode2api-substituted-model': `${substitutedFrom} -> ${substitutedTo}` }
+            : {}),
         });
         const reader = result.stream.getReader();
         let clientClosed = false;
@@ -2305,13 +3442,20 @@ function normalizeFreeModelAlias(bodyStr: string | undefined): string | undefine
           } catch {}
         }
       } else {
-        // Standard response
+        // Standard response. This is the single place token accounting happens:
+        // it is the only site that sees the final response for every path
+        // (per-key slot, WARP, ZenProxy relay, direct fallback). Recording in
+        // dispatch() as well double-counted every request, and left relay
+        // requests — which never reached those branches — recorded at zero.
         const respBody = result.body || '{}';
         const usage = extractUsageFromResponse(respBody);
         if (usage.tokens > 0) recordKeyUsage(authKey, usage.tokens);
         nodeRes.writeHead(result.status, {
           'content-type': 'application/json',
           'access-control-allow-origin': '*',
+          ...(substitutedTo
+            ? { 'x-opencode2api-substituted-model': `${substitutedFrom} -> ${substitutedTo}` }
+            : {}),
         });
         nodeRes.end(respBody);
       }
@@ -2391,8 +3535,12 @@ if (AUTO_SCRAPE_HOURS > 0) {
 
 async function main() {
   console.log('═══════════════════════════════════════════════════');
-  console.log('  ZenGate — Per-Key IP Pool Reverse Proxy Gateway');
+  console.log('  OpenCode2API — Per-Key IP Pool Reverse Proxy Gateway');
   console.log('═══════════════════════════════════════════════════');
+
+  // DATA_DIR is often a fresh mount, so create it before anything writes.
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  console.log(`[Startup] State directory: ${DATA_DIR}`);
 
   // Load keys
   loadKeys();
@@ -2418,6 +3566,17 @@ async function main() {
 
   // Initialize custom proxies
   await initCustomSlots();
+
+  // Discover free models and establish which are actually callable. Runs
+  // before the listener comes up so the first caller does not race an
+  // unverified list and get routed onto a known-dead model.
+  try {
+    await fetchModelsFromUpstream();
+    await verifyFreeModels();
+  } catch (e: any) {
+    console.warn(`[Startup] Model discovery failed: ${e?.message || e}`);
+  }
+  setInterval(verifyFreeModels, MODEL_VERIFY_INTERVAL_MS);
 
   // Start HTTP server
   server.listen(PORT, () => {

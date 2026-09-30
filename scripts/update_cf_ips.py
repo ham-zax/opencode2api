@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Cloudflare IP Latency Tester & Daily 500ip Generator for ZenGate
+Cloudflare IP Latency Tester & Daily 500ip Generator for OpenCode2API
 
 Tests TLS handshake round-trip latency to opencode.ai across Cloudflare Anycast IPs,
 ranks them by speed, and generates formatted 500ip.txt and cfip_opencode_formatted.txt.

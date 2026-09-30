@@ -14,15 +14,15 @@ services:
       qwrt_macnet:
         ipv4_address: 192.168.1.201
 
-  zengate:
-    image: zengate:latest
-    container_name: zengate
+  opencode2api:
+    image: opencode2api:latest
+    container_name: opencode2api
     restart: always
     depends_on:
       - opencode-warp
     volumes:
-      - /home/spfnas/zengate/public:/app/public
-      - /home/spfnas/zengate/data:/app/data
+      - /home/spfnas/opencode2api/public:/app/public
+      - /home/spfnas/opencode2api/data:/app/data
     environment:
       - PORT=13339
       - WARP_MODE=on

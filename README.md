@@ -1,8 +1,8 @@
-# ZenGate ⚡ (`opencodezengate-freeapi`)
+# OpenCode2API ⚡ (`opencode2api`)
 
 > **High-Performance Multi-IP Reverse Proxy Gateway & Rate-Limit Bypass for OpenCode Zen Free AI Models (`opencode` & `opencode2`)**
 
-[![Daily IP Update](https://github.com/ham-zax/opencodezengate-freeapi/actions/workflows/daily-ip-update.yml/badge.svg)](https://github.com/ham-zax/opencodezengate-freeapi/actions/workflows/daily-ip-update.yml)
+[![Daily IP Update](https://github.com/ham-zax/opencode2api/actions/workflows/daily-ip-update.yml/badge.svg)](https://github.com/ham-zax/opencode2api/actions/workflows/daily-ip-update.yml)
 [![OpenCode](https://img.shields.io/badge/OpenCode%20%2F%20OpenCode2-Compatible-orange?style=flat-square)](https://opencode.ai)
 [![Runtime](https://img.shields.io/badge/runtime-Bun%20%7C%20Node.js-black?style=flat-square&logo=bun)](https://bun.sh)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue?style=flat-square&logo=typescript)](https://www.typescriptlang.org/)
@@ -15,9 +15,9 @@
 
 ## 🎯 Purpose & Overview
 
-**ZenGate** (`opencodezengate-freeapi`) is an intelligent reverse proxy gateway built specifically to unlock, accelerate, and balance access to **free AI models** hosted on [opencode.ai/zen](https://opencode.ai/zen) (including **Claude Sonnet 4.6**, **DeepSeek V4 Flash**, **Gemini 3.7 Flash**, **GPT-5.4**, **GLM 5.2**, and **Kimi K2.7 Code**).
+**OpenCode2API** (`opencode2api`) is an intelligent reverse proxy gateway built specifically to unlock, accelerate, and balance access to **free AI models** hosted on [opencode.ai/zen](https://opencode.ai/zen) (including **Claude Sonnet 4.6**, **DeepSeek V4 Flash**, **Gemini 3.7 Flash**, **GPT-5.4**, **GLM 5.2**, and **Kimi K2.7 Code**).
 
-Direct access to free AI tiers on OpenCode Zen often results in strict single-IP rate limits (`HTTP 429: FreeUsageLimitError`), connection drops, and concurrency bottlenecks. **ZenGate** solves this by:
+Direct access to free AI tiers on OpenCode Zen often results in strict single-IP rate limits (`HTTP 429: FreeUsageLimitError`), connection drops, and concurrency bottlenecks. **OpenCode2API** solves this by:
 1. **Multi-IP Proxy Slot Pools**: Maintaining an isolated pool of healthy proxy slots per API key.
 2. **Anycast Edge Routing**: Routing requests across hundreds of optimized Cloudflare Anycast edge IPs.
 3. **Smart 429 Bypass & Failover**: Applying exponential backoff to rate-limited nodes while preserving prompt cache affinity on active nodes.
@@ -45,7 +45,7 @@ Direct access to free AI tiers on OpenCode Zen often results in strict single-IP
                                       │
                                       ▼
                         ┌───────────────────────────┐
-                        │      ZenGate (:13339)     │
+                        │      OpenCode2API (:13339)     │
                         │  • Auth & Concurrency     │
                         │  • Request Dispatcher     │
                         └─────────────┬─────────────┘
@@ -81,8 +81,8 @@ Direct access to free AI tiers on OpenCode Zen often results in strict single-IP
 
 ```bash
 # Clone repository
-git clone https://github.com/ham-zax/opencodezengate-freeapi.git
-cd opencodezengate-freeapi
+git clone https://github.com/ham-zax/opencode2api.git
+cd opencode2api
 
 # Install dependencies
 bun install
@@ -97,10 +97,10 @@ bun run gate-docker.ts
 
 ```bash
 # Start in background
-nohup bun run gate-docker.ts > zengate.log 2>&1 &
+nohup bun run gate-docker.ts > opencode2api.log 2>&1 &
 
 # View live logs anytime
-tail -f zengate.log
+tail -f opencode2api.log
 
 # Stop the background process
 pkill -f "gate-docker.ts"
@@ -111,7 +111,7 @@ pkill -f "gate-docker.ts"
 ### Option 3: Run with Docker Compose (Production)
 
 ```bash
-# Start ZenGate container
+# Start OpenCode2API container
 docker compose up -d
 
 # View live logs
@@ -127,70 +127,70 @@ Gateway will be live at `http://localhost:13339` with Web Dashboard accessible a
 
 ## 👤 Human Instructions & OpenCode / OpenCode2 Setup Guide
 
-Follow these steps to configure `opencode` or `opencode2` CLI to use ZenGate for unlimited free AI completions.
+Follow these steps to configure `opencode` or `opencode2` CLI to use OpenCode2API for unlimited free AI completions.
 
-### Step 1: Start ZenGate
-Ensure ZenGate is running on `http://127.0.0.1:13339` (using Bun or Docker).
+### Step 1: Start OpenCode2API
+Ensure OpenCode2API is running on `http://127.0.0.1:13339` (using Bun or Docker).
 
 ### Step 2: Configure `~/.config/opencode/opencode.json`
-Add the `zengate` provider to your `~/.config/opencode/opencode.json` file under `"provider"`:
+Add the `opencode2api` provider to your `~/.config/opencode/opencode.json` file under `"provider"`:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "provider": {
-    "zengate": {
+    "opencode2api": {
       "npm": "@ai-sdk/openai-compatible",
-      "name": "ZenGate",
+      "name": "OpenCode2API",
       "options": {
         "baseURL": "http://127.0.0.1:13339/v1",
         "apiKey": "admin123"
       },
       "models": {
         "big-pickle": {
-          "name": "Big Pickle (ZenGate Free)",
+          "name": "Big Pickle (OpenCode2API Free)",
           "reasoning": true,
           "limit": { "context": 200000, "output": 32000 },
           "modalities": { "input": ["text"], "output": ["text"] }
         },
         "muse-spark-1.3-free": {
-          "name": "Muse Spark 1.3 Free (ZenGate)",
+          "name": "Muse Spark 1.3 Free (OpenCode2API)",
           "reasoning": true,
           "limit": { "context": 1048576, "output": 131072 },
           "modalities": { "input": ["text", "image", "video", "pdf", "audio"], "output": ["text"] }
         },
         "muse-spark-1.2-free": {
-          "name": "Muse Spark 1.2 Free (ZenGate)",
+          "name": "Muse Spark 1.2 Free (OpenCode2API)",
           "reasoning": true,
           "limit": { "context": 1048576, "output": 131072 },
           "modalities": { "input": ["text", "image", "video", "pdf", "audio"], "output": ["text"] }
         },
         "ling-3.0-flash-fin-free": {
-          "name": "Ling 3.0 Flash Fin (ZenGate Free)",
+          "name": "Ling 3.0 Flash Fin (OpenCode2API Free)",
           "reasoning": true,
           "limit": { "context": 262144, "output": 32768 },
           "modalities": { "input": ["text"], "output": ["text"] }
         },
         "nemotron-3.5-lightning-free": {
-          "name": "Nemotron 3.5 Lightning (ZenGate Free)",
+          "name": "Nemotron 3.5 Lightning (OpenCode2API Free)",
           "reasoning": true,
           "limit": { "context": 262144, "output": 262144 },
           "modalities": { "input": ["text", "image"], "output": ["text"] }
         },
         "nemotron-3-ultra-free": {
-          "name": "Nemotron 3 Ultra (ZenGate Free)",
+          "name": "Nemotron 3 Ultra (OpenCode2API Free)",
           "reasoning": true,
           "limit": { "context": 1000000, "output": 128000 },
           "modalities": { "input": ["text"], "output": ["text"] }
         },
         "deepseek-v4-flash-free": {
-          "name": "DeepSeek V4 Flash (ZenGate Free)",
+          "name": "DeepSeek V4 Flash (OpenCode2API Free)",
           "reasoning": true,
           "limit": { "context": 200000, "output": 128000 },
           "modalities": { "input": ["text"], "output": ["text"] }
         },
         "mimo-v2.5-free": {
-          "name": "MiMo 2.5 (ZenGate Free)",
+          "name": "MiMo 2.5 (OpenCode2API Free)",
           "reasoning": true,
           "limit": { "context": 200000, "output": 32000 },
           "modalities": { "input": ["text", "image", "audio", "video"], "output": ["text"] }
@@ -206,13 +206,13 @@ Verify your models and run queries directly:
 
 ```bash
 # Verify models are recognized
-opencode2 models | grep zengate
+opencode2 models | grep opencode2api
 
 # Run prompts with Nemotron 3.5 Lightning
-opencode2 run --model zengate/nemotron-3.5-lightning-free "Explain the difference between TCP and UDP"
+opencode2 run --model opencode2api/nemotron-3.5-lightning-free "Explain the difference between TCP and UDP"
 
 # Run prompts with Hunyuan 3 (hy3-free)
-opencode2 run --model zengate/hy3-free "What is 2+2?"
+opencode2 run --model opencode2api/hy3-free "What is 2+2?"
 ```
 
 ### Step 4: Web Admin Dashboard
@@ -236,7 +236,7 @@ Agents working in this codebase should review `AGENT_INSTRUCTIONS.md` for header
 
 ## 💻 Standard OpenAI SDK Client Examples
 
-ZenGate acts as a drop-in replacement for OpenAI endpoints (`baseURL: http://localhost:13339/v1`).
+OpenCode2API acts as a drop-in replacement for OpenAI endpoints (`baseURL: http://localhost:13339/v1`).
 
 ### Python (OpenAI SDK)
 
@@ -274,7 +274,7 @@ const openai = new OpenAI({
 async function main() {
   const stream = await openai.chat.completions.create({
     model: "claude-sonnet-4-6",
-    messages: [{ role: "user", content: "Hello from ZenGate!" }],
+    messages: [{ role: "user", content: "Hello from OpenCode2API!" }],
     stream: true,
   });
 
@@ -303,7 +303,7 @@ curl http://localhost:13339/v1/chat/completions \
 
 ## ⚙️ Configuration Reference
 
-ZenGate can be configured via environment variables in `docker-compose.yml` or your local `.env`:
+OpenCode2API can be configured via environment variables in `docker-compose.yml` or your local `.env`:
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
@@ -341,7 +341,7 @@ ZenGate can be configured via environment variables in `docker-compose.yml` or y
 ## 📁 Repository Structure
 
 ```
-opencodezengate-freeapi/
+opencode2api/
 ├── AGENT_INSTRUCTIONS.md # Detailed developer and AI agent instructions
 ├── gate-docker.ts        # Standalone per-key multi-slot proxy pool gateway
 ├── gate.ts               # SingBox edition reverse proxy gateway
