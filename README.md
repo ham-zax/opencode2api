@@ -15,7 +15,13 @@
 
 ## 🎯 Purpose & Overview
 
-**OpenCode2API** (`opencode2api`) is an intelligent reverse proxy gateway built specifically to unlock, accelerate, and balance access to **free AI models** hosted on [opencode.ai/zen](https://opencode.ai/zen) (including **Claude Sonnet 4.6**, **DeepSeek V4 Flash**, **Gemini 3.7 Flash**, **GPT-5.4**, **GLM 5.2**, and **Kimi K2.7 Code**).
+**OpenCode2API** (`opencode2api`) is an intelligent reverse proxy gateway built specifically to unlock, accelerate, and balance access to **free text-generation models** hosted on [OpenCode Zen](https://opencode.ai/zen), such as Big Pickle and Muse Spark. It targets the `opencode` provider; OpenCode Go subscriptions use a separate provider and endpoint.
+
+Models are discovered from Zen's live `/v1/models` list and the `opencode` pricing and transport metadata in models.dev. Only zero-cost, active text models using Chat or Responses are admitted. Deprecated entries, Go-only entries, structured-decision models such as Jev, and unsupported transports are excluded. Muse compatibility aliases are generated for future versions automatically. Query `/v1/models` for current IDs instead of relying on a fixed list.
+
+Discovery refreshes on demand after five minutes and before each scheduled health check. Refresh failures retain the last successful catalog for up to 24 hours, including across restarts via `DATA_DIR/models_cache.json`; the gateway fails closed when no valid catalog remains. `/api/models` and `/v1/models` report catalog age, refresh errors, and exclusion reasons. Probes distinguish unavailable models from rate limits and share health with aliases. Requests for a supported but unavailable model may be substituted, with `x-opencode2api-substituted-model` identifying the change. Unknown or excluded IDs return HTTP 400.
+
+Chat clients can use `/v1/chat/completions` for all admitted models: the gateway translates Responses models automatically. Native Responses clients use `/v1/responses` for Responses models. Both endpoints support streaming and JSON replies. The [installed OpenCode2 API capture](docs/opencode2-api.md) records the verified protocol. Native client User-Agent values are preserved; `OPENCODE_USER_AGENT` overrides the gateway's default captured client version.
 
 Direct access to free AI tiers on OpenCode Zen often results in strict single-IP rate limits (`HTTP 429: FreeUsageLimitError`), connection drops, and concurrency bottlenecks. **OpenCode2API** solves this by:
 1. **Multi-IP Proxy Slot Pools**: Maintaining an isolated pool of healthy proxy slots per API key.
@@ -147,59 +153,33 @@ Add the `opencode2api` provider to your `~/.config/opencode/opencode.json` file 
         "apiKey": "admin123"
       },
       "models": {
-        "big-pickle": {
-          "name": "Big Pickle (OpenCode2API Free)",
-          "reasoning": true,
-          "limit": { "context": 200000, "output": 32000 },
-          "modalities": { "input": ["text"], "output": ["text"] }
-        },
-        "muse-spark-1.3-free": {
-          "name": "Muse Spark 1.3 Free (OpenCode2API)",
-          "reasoning": true,
-          "limit": { "context": 1048576, "output": 131072 },
-          "modalities": { "input": ["text", "image", "video", "pdf", "audio"], "output": ["text"] }
-        },
-        "muse-spark-1.2-free": {
-          "name": "Muse Spark 1.2 Free (OpenCode2API)",
-          "reasoning": true,
-          "limit": { "context": 1048576, "output": 131072 },
-          "modalities": { "input": ["text", "image", "video", "pdf", "audio"], "output": ["text"] }
-        },
-        "ling-3.0-flash-fin-free": {
-          "name": "Ling 3.0 Flash Fin (OpenCode2API Free)",
-          "reasoning": true,
-          "limit": { "context": 262144, "output": 32768 },
-          "modalities": { "input": ["text"], "output": ["text"] }
-        },
-        "nemotron-3.5-lightning-free": {
-          "name": "Nemotron 3.5 Lightning (OpenCode2API Free)",
-          "reasoning": true,
-          "limit": { "context": 262144, "output": 262144 },
-          "modalities": { "input": ["text", "image"], "output": ["text"] }
-        },
-        "nemotron-3-ultra-free": {
-          "name": "Nemotron 3 Ultra (OpenCode2API Free)",
-          "reasoning": true,
-          "limit": { "context": 1000000, "output": 128000 },
-          "modalities": { "input": ["text"], "output": ["text"] }
-        },
-        "deepseek-v4-flash-free": {
-          "name": "DeepSeek V4 Flash (OpenCode2API Free)",
-          "reasoning": true,
-          "limit": { "context": 200000, "output": 128000 },
-          "modalities": { "input": ["text"], "output": ["text"] }
-        },
-        "mimo-v2.5-free": {
-          "name": "MiMo 2.5 (OpenCode2API Free)",
-          "reasoning": true,
-          "limit": { "context": 200000, "output": 32000 },
-          "modalities": { "input": ["text", "image", "audio", "video"], "output": ["text"] }
-        }
+        "big-pickle": { "name": "Big Pickle" },
+        "muse-spark-1.3-free": { "name": "Muse Spark 1.3 Free" }
       }
     }
   }
 }
 ```
+
+OpenCode2 v2 uses `providers`, `package`, and `settings`. The equivalent provider entry is:
+
+```json
+{
+  "providers": {
+    "opencode2api": {
+      "name": "OpenCode2API",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": { "baseURL": "http://127.0.0.1:13339/v1", "apiKey": "admin123" },
+      "models": {
+        "big-pickle": { "name": "Big Pickle" },
+        "muse-spark-1.3-free": { "name": "Muse Spark 1.3 Free" }
+      }
+    }
+  }
+}
+```
+
+Use IDs currently returned by the gateway when adding more models.
 
 ### Step 3: Run with OpenCode2 CLI
 Verify your models and run queries directly:
@@ -327,7 +307,8 @@ OpenCode2API can be configured via environment variables in `docker-compose.yml`
 | :--- | :--- | :--- |
 | `GET` | `/` | Serves Web Admin Dashboard |
 | `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions |
-| `GET` | `/v1/models` | List available free models |
+| `GET` | `/v1/models` | List current free Zen models and catalog status |
+| `POST` | `/v1/responses` | Native Responses requests for Responses models |
 | `GET` | `/api/status` | Complete gateway health, slot, and memory metrics |
 | `GET` / `POST` | `/api/keys` | List or create API keys |
 | `PUT` / `DELETE`| `/api/keys/:key` | Update key quotas or revoke key |
@@ -367,3 +348,7 @@ opencode2api/
 ## 📄 License
 
 This project is licensed under the [MIT License](LICENSE).
+
+## Verification
+
+Run `bun test` for isolated pool, catalog, request-routing, JSON, and SSE regression checks. Tests do not call external services. Check the production bundle with `bun build gate-docker.ts --target=bun --outfile=/tmp/opencode2api.js`.

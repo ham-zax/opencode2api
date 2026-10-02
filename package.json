@@ -6,7 +6,8 @@
   "private": true,
   "main": "gate-docker.ts",
   "scripts": {
-    "start": "bun run gate-docker.ts"
+    "start": "bun run gate-docker.ts",
+    "test": "bun test"
   },
   "dependencies": {
     "geoip-lite": "^2.0.3",

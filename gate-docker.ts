@@ -14,10 +14,12 @@ import http from 'node:http';
 import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
+import { isIP } from 'node:net';
 import { spawn } from 'node:child_process';
 import { HttpsProxyAgent } from 'hpagent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import geoip from 'geoip-lite';
+import { buildZenCatalog, resolveCatalogModel, type ZenModel } from './model-catalog';
 
 // ═══════════════════════════════════════════════════════════
 //  Type Definitions
@@ -353,17 +355,11 @@ let warpSlot: Slot | null = null;
 let warpConsecutiveFails = 0;
 let warpSkipUntil = 0;
 
-let cachedModels: any[] = [];
+let cachedModels: ZenModel[] = [];
 let cachedModelsTime = 0;
 
-// Advertising a model in /v1/models says nothing about whether it can actually
-// be called. Verified against upstream on 2026-09-30: of 13 advertised free
-// model IDs, exactly one returned a usable answer. The rest failed with
-// FreeTierError 403 (client-only tier), "Model is unavailable" 400, or
-// provider-side 500 — several of those reproduce on a proxyless direct request
-// from an unblocked region, so they are upstream faults, not egress faults.
-// Track per-model reachability so the gateway can route around the dead ones
-// instead of surfacing their raw error to every caller.
+// Catalog membership establishes pricing and transport; live probes establish
+// availability independently, so a rate limit never changes model pricing.
 type ModelVerdict = 'unknown' | 'healthy' | 'dead';
 
 interface ModelHealth {
@@ -447,6 +443,7 @@ function freeTierStubToolset(names: string[]): any[] {
 // caller-facing contract still has to be a single JSON object.
 function shapeAgentRequest(
   bodyStr: string,
+  endpoint: 'chat' | 'responses' = 'chat',
 ): { body: string; callerWantsStream: boolean; reshaped: boolean } {
   if (!FREE_TIER_AGENT_SHAPE) {
     let wantsStream = false;
@@ -466,21 +463,22 @@ function shapeAgentRequest(
   let changed = false;
 
   if (parsed.stream !== true) { parsed.stream = true; changed = true; }
-  if (!parsed.stream_options || parsed.stream_options.include_usage !== true) {
+  if (endpoint === 'chat' && (!parsed.stream_options || parsed.stream_options.include_usage !== true)) {
     parsed.stream_options = { ...(parsed.stream_options || {}), include_usage: true };
     changed = true;
   }
 
-  // Declare the core tools when the caller sent none. Names the caller already
-  // declared are left alone so real tool definitions are never overwritten.
+  if (endpoint === 'responses' && parsed.stream_options) { delete parsed.stream_options; changed = true; }
+
+  // Preserve native/client toolsets. Declare fallback tools only when absent.
   const declared: string[] = Array.isArray(parsed.tools)
     ? parsed.tools.map((t: any) => String(t?.function?.name || t?.name || '')).filter(Boolean)
     : [];
-  const missing = FREE_TIER_CORE_TOOLS.filter(n => !declared.includes(n));
+  const missing = declared.length ? [] : FREE_TIER_CORE_TOOLS;
   if (missing.length) {
-    parsed.tools = Array.isArray(parsed.tools)
-      ? [...parsed.tools, ...freeTierStubToolset(missing)]
-      : freeTierStubToolset(missing);
+    const tools = freeTierStubToolset(missing).map(t => endpoint === 'responses'
+      ? { type: 'function', ...t.function } : t);
+    parsed.tools = Array.isArray(parsed.tools) ? [...parsed.tools, ...tools] : tools;
     changed = true;
   }
 
@@ -503,10 +501,19 @@ function isHardFailure(status: number): boolean {
 
 // models.dev pricing metadata: source of truth for cost==0 (free), so stealth
 // free models like `big-pickle` (no `-free` suffix) are detected without hardcoding.
-let modelsDevFreeIds: Set<string> | null = null;
+let modelsDevMetadata: any = null;
 let modelsDevTime = 0;
 const MODELS_DEV_URL = 'https://models.dev/api.json';
 const MODELS_DEV_TTL_MS = 3600000;
+const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
+const MODEL_CATALOG_MAX_STALE_MS = 24 * 60 * 60 * 1000;
+const MODEL_CATALOG_RETRY_MS = 30 * 1000;
+const MODEL_CATALOG_FILE = path.join(DATA_DIR, 'models_cache.json');
+const OPENCODE_USER_AGENT = process.env.OPENCODE_USER_AGENT || 'opencode/latest/2.0.21/cli';
+let catalogRefresh: Promise<ZenModel[]> | null = null;
+let catalogLastAttempt = 0;
+let catalogLastError = '';
+let catalogExcluded: { id: string; reason: string }[] = [];
 
 const API_KEY = process.env.API_KEY || 'admin123';
 
@@ -730,12 +737,19 @@ function releaseKey(key: string) {
   if (activeRequests[key] && activeRequests[key] > 0) activeRequests[key]--;
 }
 
+function recordKeyRequest(key: string) {
+  const record = apiKeys[key];
+  if (!record) return;
+  record.lastUsedAt = Date.now();
+  record.totalRequests++;
+  record.requestCount++;
+  saveKeys();
+}
+
 function recordKeyUsage(key: string, tokens: number) {
   const record = apiKeys[key];
   if (record) {
     record.lastUsedAt = Date.now();
-    record.totalRequests++;
-    record.requestCount++;
     record.totalTokens += tokens;
     saveKeys();
   }
@@ -969,6 +983,7 @@ async function loadCandidates(): Promise<void> {
     const key = `${item.protocol}://${item.address}`;
     if (!seen.has(key)) { seen.add(key); all.push(item); }
   }
+  const previous = new Map(candidates.map(c => [`${c.protocol}://${c.address}`, c]));
   // Geo-filtering: remove proxies from blocked regions (China, Russia, Iran, etc.)
   let geoBlockedCount = 0;
   const filtered: ProxyItem[] = [];
@@ -976,8 +991,16 @@ async function loadCandidates(): Promise<void> {
     const ip = item.address.split(':')[0];
     // Fresh lookup first: source-stored countries go stale and let
     // blocked regions leak through (e.g. reassigned RU IPs).
-    const country = geoip.lookup(ip)?.country || item.country || 'UNKNOWN';
+    const old = previous.get(`${item.protocol}://${item.address}`);
+    const live = geoVerified.get(ip);
+    const country = (live && Date.now() - live.checkedAt < GEO_VERIFY_TTL_MS ? live.country : undefined)
+      || (old && isValidated(old.address) ? old.country : undefined)
+      || geoip.lookup(ip)?.country || item.country || 'UNKNOWN';
     item.country = country;
+    if (old && isValidated(old.address)) {
+      item.latency = old.latency;
+      item.quality_grade = old.quality_grade;
+    }
     if (BLOCKED_COUNTRIES.has(country)) {
       geoBlockedCount++;
       continue;
@@ -1000,12 +1023,15 @@ async function loadCandidates(): Promise<void> {
     return (a.failCount || 0) - (b.failCount || 0);
   });
 
-  const oldLocked = new Map<string, string>();
-  for (const c of candidates) { if (c.lockedBy) oldLocked.set(c.address, c.lockedBy); }
-  candidates = filtered.map(item => ({
-    ...item,
-    lockedBy: oldLocked.get(item.address) || null,
-  }));
+  // Preserve object identity: in-flight probes and cooldown timers still hold
+  // these objects. Replacing them loses measurements, failures and ownership.
+  candidates = filtered.map(item => {
+    const old = previous.get(`${item.protocol}://${item.address}`);
+    return old ? Object.assign(old, item) : { ...item, lockedBy: null };
+  });
+  for (const old of previous.values()) {
+    if (keySlotPools.has(old.lockedBy || '') && !candidates.includes(old)) candidates.push(old);
+  }
   const srcCount = proxySources.length;
   const preferredCount = candidates.filter(c => PREFERRED_COUNTRIES.has(c.country || '')).length;
   console.log(`[GeoFilter] Filtered out ${geoBlockedCount} proxies from blocked regions (RU, CN)`);
@@ -1027,12 +1053,27 @@ function makeAgent(url: string, proto: 'http' | 'socks5', timeoutMs = STREAM_TIM
   }) as unknown as https.Agent;
 }
 
+const probesInFlight = new Map<string, Promise<{ ok: boolean; latencyMs: number }>>();
+
 async function probe(item: ProxyItem): Promise<{ ok: boolean; latencyMs: number }> {
+  const key = `${item.protocol}://${item.address}`;
+  let pending = probesInFlight.get(key);
+  if (!pending) {
+    pending = measureProxy(item);
+    probesInFlight.set(key, pending);
+  }
+  try { return await pending; }
+  finally { if (probesInFlight.get(key) === pending) probesInFlight.delete(key); }
+}
+
+async function measureProxy(item: ProxyItem): Promise<{ ok: boolean; latencyMs: number }> {
   const url = item.protocol === 'socks5' ? `socks5h://${item.address}` : `http://${item.address}`;
   const agent = makeAgent(url, item.protocol as 'http' | 'socks5', PROXY_PROBE_TIMEOUT);
   const start = Date.now();
   try {
     const result = await new Promise<{ ok: boolean }>((resolve) => {
+      let timer: ReturnType<typeof setTimeout>;
+      const finish = (value: { ok: boolean }) => { clearTimeout(timer); resolve(value); };
       const req = https.request(`${UPSTREAM}/v1/models`, {
         method: 'GET',
         headers: {
@@ -1051,17 +1092,20 @@ async function probe(item: ProxyItem): Promise<{ ok: boolean; latencyMs: number 
         res.on('end', () => {
           // Status 200 is not enough: captive portals and hijacked proxies
           // return 200 with an HTML login page. Require a real models payload.
-          if (res.statusCode! < 200 || res.statusCode! >= 400) return resolve({ ok: false });
+          if (res.statusCode! < 200 || res.statusCode! >= 400) return finish({ ok: false });
           try {
             const parsed = JSON.parse(Buffer.concat(chunks).toString('utf-8'));
-            resolve({ ok: Array.isArray(parsed?.data) });
+            finish({ ok: Array.isArray(parsed?.data) });
           } catch {
-            resolve({ ok: false });
+            finish({ ok: false });
           }
         });
+        res.on('error', () => finish({ ok: false }));
+        res.on('aborted', () => finish({ ok: false }));
       });
-      req.on('error', () => resolve({ ok: false }));
-      req.on('timeout', () => { req.destroy(); resolve({ ok: false }); });
+      req.on('error', () => finish({ ok: false }));
+      req.on('timeout', () => { req.destroy(); finish({ ok: false }); });
+      timer = setTimeout(() => { req.destroy(); finish({ ok: false }); }, PROXY_PROBE_TIMEOUT);
       req.end();
     });
     return { ok: result.ok, latencyMs: Date.now() - start };
@@ -1071,6 +1115,255 @@ async function probe(item: ProxyItem): Promise<{ ok: boolean; latencyMs: number 
     try { agent.destroy(); } catch {}
   }
 }
+
+// ── Pool state machine ──
+// Ported from FishBottle7/opencode2dsh (pool/refill.ts, which took it from
+// GoProxy). How much free capacity the pool has decides how strict admission
+// is and which sources get scraped. Without this the admission ceiling is
+// either too tight to fill slots or too loose to keep slow, lossy proxies.
+type PoolState = 'healthy' | 'warning' | 'critical' | 'emergency';
+
+// Free (unlocked) exits needed to serve every key without contention.
+const POOL_TARGET = Math.max(60, SLOTS_PER_KEY * MAX_ACTIVE_KEYS * 2);
+const POOL_TIERS: Record<PoolState, { min: number; admitMs: number; scrapeAll: boolean }> = {
+  healthy:   { min: POOL_TARGET,      admitMs: 1200, scrapeAll: false },
+  warning:   { min: Math.round(POOL_TARGET * 0.4), admitMs: 2000, scrapeAll: false },
+  critical:  { min: Math.round(POOL_TARGET * 0.15), admitMs: 3500, scrapeAll: true },
+  emergency: { min: 0,               admitMs: 0,    scrapeAll: true },
+};
+
+// Only exits that have actually answered a coarse screen count towards pool
+// health. A free public list can hold tens of thousands of entries of which a
+// few percent are alive, so counting raw list entries reported "healthy" while
+// almost nothing worked. Ageing entries drop out, which keeps a proxy that
+// died since its last check from inflating the number.
+const VALIDATED_TTL_MS = 15 * 60_000;
+const validatedExits = new Map<string, number>();
+
+function markValidated(addr: string): void { validatedExits.set(addr, Date.now()); }
+function isValidated(addr: string): boolean {
+  const at = validatedExits.get(addr);
+  if (at === undefined) return false;
+  if (Date.now() - at > VALIDATED_TTL_MS) { validatedExits.delete(addr); return false; }
+  return true;
+}
+
+function freeExitCount(): number {
+  const exits = new Set<string>();
+  for (const c of candidates) {
+    if (c.lockedBy) continue;
+    if (!isExitUsable(c.address, undefined)) continue;
+    if (!isValidated(c.address)) continue;
+    exits.add(c.address);
+  }
+  return exits.size;
+}
+
+function currentPoolState(): PoolState {
+  const free = freeExitCount();
+  if (free >= POOL_TIERS.healthy.min) return 'healthy';
+  if (free >= POOL_TIERS.warning.min) return 'warning';
+  if (free >= POOL_TIERS.critical.min) return 'critical';
+  return 'emergency';
+}
+
+/** Latency ceiling for admitting a new exit right now. */
+function admissionCeilingMs(): number {
+  return POOL_TIERS[currentPoolState()].admitMs;
+}
+
+/** Grade an exit from its measured latency rather than the feed's self-report. */
+function gradeFromLatency(latencyMs: number): string {
+  if (latencyMs <= 500) return 'S';
+  if (latencyMs <= 1000) return 'A';
+  if (latencyMs <= 2000) return 'B';
+  return 'C';
+}
+
+// ── Coarse screen ──
+// Candidates are screened against a public IP echo *through the proxy* before
+// any request spends anonymous-lane quota. One call yields reachability, the
+// real exit IP, the geo-block check and the latency, so the expensive upstream
+// probe only ever runs on exits that already look usable — and the screen can
+// fan out wide because it costs nothing. Same two-tier split as
+// FishBottle7/opencode2dsh (coarseScreen vs Prober).
+const COARSE_SCREEN_URL = 'https://ipinfo.io/json';
+const COARSE_FANOUT = 40;
+type ScreenResult = { ok: boolean; country: string; latencyMs: number; reason: string };
+const coarseSeen = new Map<string, ScreenResult & { at: number }>();
+const coarseInFlight = new Map<string, Promise<ScreenResult>>();
+const COARSE_TTL_MS = 10 * 60_000;
+const COARSE_FAILURE_TTL_MS = 30_000;
+
+function applyAdmissionCeiling(result: ScreenResult, ceilingMs: number): ScreenResult {
+  if (result.ok && ceilingMs > 0 && result.latencyMs > ceilingMs) {
+    return { ...result, ok: false, reason: `latency ${result.latencyMs}ms > ${ceilingMs}ms` };
+  }
+  return result;
+}
+
+async function coarseScreen(item: ProxyItem, ceilingMs: number, force = false): Promise<ScreenResult> {
+  const cacheKey = `${item.protocol}://${item.address}`;
+  const cached = coarseSeen.get(cacheKey);
+  if (!force && cached && Date.now() - cached.at < (cached.ok ? COARSE_TTL_MS : COARSE_FAILURE_TTL_MS)) {
+    return applyAdmissionCeiling(cached, ceilingMs);
+  }
+  let pending = coarseInFlight.get(cacheKey);
+  if (!pending) {
+    pending = measureCoarseScreen(item);
+    coarseInFlight.set(cacheKey, pending);
+  }
+  try { return applyAdmissionCeiling(await pending, ceilingMs); }
+  finally { if (coarseInFlight.get(cacheKey) === pending) coarseInFlight.delete(cacheKey); }
+}
+
+async function measureCoarseScreen(item: ProxyItem): Promise<ScreenResult> {
+  const url = item.protocol === 'socks5' ? `socks5h://${item.address}` : `http://${item.address}`;
+  const agent = makeAgent(url, item.protocol as 'http' | 'socks5', PROXY_PROBE_TIMEOUT);
+  const start = Date.now();
+  let out = { ok: false, country: '', latencyMs: 0, reason: 'unreachable' };
+  try {
+    const body = await new Promise<string>((resolve) => {
+      // A socket inactivity timeout does not bound DNS, CONNECT, or a response
+      // that trickles forever. Bound the complete screen as well.
+      let timer: ReturnType<typeof setTimeout>;
+      const finish = (value: string) => { clearTimeout(timer); resolve(value); };
+      const req = https.request(COARSE_SCREEN_URL, {
+        method: 'GET',
+        headers: { accept: 'application/json', 'user-agent': 'opencode2api' },
+        agent,
+        rejectUnauthorized: false,
+        timeout: PROXY_PROBE_TIMEOUT,
+      }, (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => finish(res.statusCode === 200 ? Buffer.concat(chunks).toString('utf-8') : ''));
+        res.on('error', () => finish(''));
+        res.on('aborted', () => finish(''));
+      });
+      req.on('error', () => finish(''));
+      req.on('timeout', () => { req.destroy(); finish(''); });
+      timer = setTimeout(() => { req.destroy(); finish(''); }, PROXY_PROBE_TIMEOUT);
+      req.end();
+    });
+    const latencyMs = Date.now() - start;
+    if (!body) {
+      out = { ok: false, country: '', latencyMs, reason: 'no response' };
+    } else {
+      let doc: any;
+      try { doc = JSON.parse(body); } catch { doc = null; }
+      const country = String(doc?.country || '').toUpperCase();
+      if (typeof doc?.ip !== 'string' || !isIP(doc.ip)) {
+        out = { ok: false, country, latencyMs, reason: 'echo returned no valid IP' };
+      } else if (BLOCKED_COUNTRIES.has(country)) {
+        // The feed's own country field is stale often enough to be worth an
+        // independent check, and this is the cheapest place to catch it.
+        out = { ok: false, country, latencyMs, reason: `geo-blocked ${country}` };
+      } else {
+        out = { ok: true, country, latencyMs, reason: 'ok' };
+      }
+    }
+  } catch (e: any) {
+    out = { ok: false, country: '', latencyMs: Date.now() - start, reason: e?.message || 'error' };
+  } finally {
+    try { agent.destroy(); } catch {}
+  }
+  // Cache the measurement independently of the pool's current admission rule.
+  coarseSeen.set(`${item.protocol}://${item.address}`, { ...out, at: Date.now() });
+  return out;
+}
+
+function recordScreenMeasurement(c: CandidateItem, r: ScreenResult): void {
+  c.latency = r.latencyMs;
+  c.quality_grade = gradeFromLatency(r.latencyMs);
+  if (r.country) c.country = r.country;
+  markValidated(c.address);
+}
+
+function recordCandidateFailure(c: CandidateItem): void {
+  validatedExits.delete(c.address);
+  c.failCount = (c.failCount || 0) + 1;
+  if (c.failCount < MAX_CANDIDATE_FAILS) return;
+  const pool = keySlotPools.get(c.lockedBy || '');
+  if (pool) {
+    pool.slots = pool.slots.filter(s => s.addr !== c.address);
+    c.lockedBy = '__blacklist__';
+    console.log(`[Prober] ${c.address} dead, removed from key ${pool.keyId.slice(0, 7)}...`);
+  } else if (!c.lockedBy) {
+    candidates = candidates.filter(item => item.address !== c.address);
+    const custIdx = customProxyItems.findIndex(item => item.address === c.address);
+    if (custIdx >= 0) { customProxyItems.splice(custIdx, 1); saveCustomProxies(); }
+    console.log(`[Evict] ${c.address} failed ${c.failCount}x, removed`);
+  }
+}
+
+// ── Background prober ──
+// ZenGate only ever validated a proxy while allocating a slot, so a proxy that
+// was healthy at allocation could rot silently and stay in a live key's pool
+// until a real request failed. This sweeps continuously and re-checks exits,
+// including ones already allocated, with at most one in-flight probe per exit
+// so a slow proxy cannot be probed twice at once.
+const PROBER_INTERVAL_MS = parseInt(process.env.PROBER_INTERVAL_MS || `${5 * 60_000}`);
+const PROBER_SAMPLE = 40;
+const exitProbeInFlight = new Set<string>();
+let lockedProbeCursor = 0;
+let freeProbeCursor = 0;
+
+async function backgroundProbeSweep(): Promise<void> {
+  if (verifyingProxies) return;
+  verifyingProxies = true;
+  try {
+    const state = currentPoolState();
+    const ceiling = POOL_TIERS[state].admitMs;
+    // Sample across the pool: allocated exits first (a dead one is actively
+    // hurting a key), then free ones to keep supply up.
+    const eligible = candidates.filter(c => !exitProbeInFlight.has(c.address));
+    const locked = eligible.filter(c => keySlotPools.has(c.lockedBy || ''));
+    const free = eligible.filter(c => !c.lockedBy && isExitUsable(c.address, undefined));
+    const take = (items: CandidateItem[], cursor: number, count: number) =>
+      Array.from({ length: Math.min(count, items.length) }, (_, i) => items[(cursor + i) % items.length]);
+    const lockedCount = Math.min(locked.length, Math.ceil(PROBER_SAMPLE / 2));
+    const freeCount = Math.min(free.length, PROBER_SAMPLE - lockedCount);
+    const targets = [
+      ...take(locked, lockedProbeCursor, PROBER_SAMPLE - freeCount),
+      ...take(free, freeProbeCursor, freeCount),
+    ];
+    lockedProbeCursor = locked.length ? (lockedProbeCursor + targets.length - freeCount) % locked.length : 0;
+    freeProbeCursor = free.length ? (freeProbeCursor + freeCount) % free.length : 0;
+
+    if (!targets.length) return;
+    let alive = 0, dead = 0;
+    for (let i = 0; i < targets.length; i += COARSE_FANOUT) {
+      const batch = targets.slice(i, i + COARSE_FANOUT);
+      const verdicts = await Promise.all(batch.map(async (c) => {
+        exitProbeInFlight.add(c.address);
+        // Existing slots need reachability checks, not a new-admission cutoff.
+        const limit = c.lockedBy ? 0 : ceiling;
+        try { return { c, r: await coarseScreen(c, limit, true) }; }
+        finally { exitProbeInFlight.delete(c.address); }
+      }));
+      for (const { c, r } of verdicts) {
+        if (!candidates.includes(c)) continue;
+        if (r.ok) {
+          alive++;
+          recordScreenMeasurement(c, r);
+          c.failCount = 0;
+        } else {
+          dead++;
+          recordCandidateFailure(c);
+        }
+      }
+    }
+    if (dead || state !== 'healthy') {
+      console.log(`[Prober] state=${state} checked=${targets.length} alive=${alive} dead=${dead} free=${freeExitCount()}`);
+    }
+  } catch (e: any) {
+    console.warn(`[Prober] sweep failed: ${e?.message || e}`);
+  } finally {
+    verifyingProxies = false;
+  }
+}
+let verifyingProxies = false;
 
 function getWarpAddr(): string { return `${warpHostRuntime}:${warpPortRuntime}`; }
 function getWarpUrl(): string { return `socks5h://${warpHostRuntime}:${warpPortRuntime}`; }
@@ -1186,7 +1479,8 @@ function evictBlockedCandidates(): void {
 }
 
 async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
-  if (keySlotPools.size >= MAX_ACTIVE_KEYS && !keySlotPools.has(keyId)) {
+  const activeKeys = new Set([...keySlotPools.keys(), ...keyPoolAllocations.keys()]);
+  if (activeKeys.size >= MAX_ACTIVE_KEYS && !activeKeys.has(keyId)) {
     console.log(`[Allocate] Active keys limit reached (${MAX_ACTIVE_KEYS}), rejecting key ${keyId.slice(0, 7)}...`);
     return null;
   }
@@ -1198,7 +1492,7 @@ async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
   if (existingPool) { for (const s of existingPool.slots) usedAddrs.add(s.addr); }
 
   evictBlockedCandidates();
-  const available = candidates.filter(c => !c.lockedBy && !usedAddrs.has(c.address));
+  const available = candidates.filter(c => !c.lockedBy && !usedAddrs.has(c.address) && isExitUsable(c.address, undefined));
   const gradeOrder: Record<string, number> = { S: 0, A: 1, B: 2, C: 3 };
   available.sort((a, b) => {
     const ga = gradeOrder[a.quality_grade] ?? 99;
@@ -1220,40 +1514,62 @@ async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
   }
 
   const newSlots: Slot[] = [];
-  const groupSize = 15;
-  for (let i = 0; i < pool.length && newSlots.length < SLOTS_PER_KEY; i += groupSize) {
-    const group = pool.slice(i, i + groupSize);
-    const results = await Promise.all(group.map(async (item) => {
-      const r = await probe(item);
-      return { item, ...r };
+  const state = currentPoolState();
+  const ceilingMs = POOL_TIERS[state].admitMs;
+  // Coarse screen first: free, wide fan-out, and it catches unreachable,
+  // geo-blocked and slow exits before any anonymous-lane quota is spent.
+  // Only survivors are confirmed against the real upstream below.
+  const screened: { item: ProxyItem; latencyMs: number; country: string }[] = [];
+  for (let i = 0; i < pool.length && screened.length < SLOTS_PER_KEY * 3; i += COARSE_FANOUT) {
+    const batch = await Promise.all(pool.slice(i, i + COARSE_FANOUT).map(item => coarseScreen(item, ceilingMs)));
+    for (let j = 0; j < batch.length; j++) {
+      const r = batch[j];
+      const item = pool[i + j];
+      if (!item || !candidates.includes(item) || item.lockedBy) continue;
+      if (r.ok) { recordScreenMeasurement(item as CandidateItem, r); screened.push({ item, latencyMs: r.latencyMs, country: r.country }); }
+      else {
+        const cand = candidates.find(c => c.address === item.address);
+        if (cand) recordCandidateFailure(cand);
+      }
+    }
+  }
+  // Best measured latency first, so the fastest usable exits are the ones that
+  // get slots.
+  screened.sort((a, b) => a.latencyMs - b.latencyMs);
+  if (state !== 'healthy') {
+    console.log(`[Allocate] pool state=${state} (free=${freeExitCount()}), ceiling=${ceilingMs || 'none'}ms, ${screened.length} passed coarse screen`);
+  }
+
+  const confirm = screened.slice(0, Math.max(SLOTS_PER_KEY * 2, 12));
+  const groupSize = 10;
+  for (let i = 0; i < confirm.length && newSlots.length < SLOTS_PER_KEY; i += groupSize) {
+    const group = confirm.slice(i, i + groupSize);
+    const results = await Promise.all(group.map(async (s) => {
+      const r = await probe(s.item);
+      return { ...s, ...r };
     }));
     for (const r of results) {
       if (newSlots.length >= SLOTS_PER_KEY) break;
       const cand = candidates.find(c => c.address === r.item.address);
+      // Another key or a background sweep may have claimed/evicted this exit
+      // while the probes were awaiting network I/O.
+      if (!cand || cand.lockedBy || !isExitUsable(cand.address, undefined)) continue;
       if (!r.ok) {
-        // Track failures and evict persistently dead candidates.
-        if (cand) {
-          cand.failCount = (cand.failCount || 0) + 1;
-          if (cand.failCount >= MAX_CANDIDATE_FAILS && !cand.lockedBy) {
-            candidates.splice(candidates.indexOf(cand), 1);
-            const custIdx = customProxyItems.findIndex(c => c.address === cand.address);
-            if (custIdx >= 0) customProxyItems.splice(custIdx, 1);
-            saveCustomProxies();
-            console.log(`[Evict] ${cand.address} failed ${cand.failCount}x, removed`);
-          }
-        }
+        if (cand) recordCandidateFailure(cand);
         continue;
       }
-      if (cand) cand.failCount = 0;
+      if (cand) { cand.failCount = 0; markValidated(r.item.address); }
       const url = r.item.protocol === 'socks5' ? `socks5h://${r.item.address}` : `http://${r.item.address}`;
+      // Measured latency from the confirmation probe against the real upstream.
+      const measured = r.latencyMs || 0;
       newSlots.push({
         addr: r.item.address, url,
         proto: r.item.protocol as 'http' | 'socks5',
-        latencyMs: r.latencyMs || 0,
-        qualityGrade: r.item.quality_grade || 'C',
+        latencyMs: measured,
+        qualityGrade: gradeFromLatency(measured),
       });
       if (cand) cand.lockedBy = keyId;
-      console.log(`[Allocate+] ${r.item.address} (${r.latencyMs}ms) → Key ${keyId.slice(0, 7)}...`);
+      console.log(`[Allocate+] ${r.item.address} (${measured}ms, ${gradeFromLatency(measured)}) → Key ${keyId.slice(0, 7)}...`);
     }
   }
 
@@ -1279,7 +1595,7 @@ function releaseKeySlots(keyId: string): void {
   if (!pool) return;
   for (const slot of pool.slots) {
     const cand = candidates.find(c => c.address === slot.addr);
-    if (cand) cand.lockedBy = null;
+    if (cand?.lockedBy === keyId) cand.lockedBy = null;
   }
   const count = pool.slots.length;
   keySlotPools.delete(keyId);
@@ -1287,10 +1603,11 @@ function releaseKeySlots(keyId: string): void {
 }
 
 async function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): Promise<void> {
+  if (keySlotPools.get(pool.keyId) !== pool) return;
   const idx = pool.slots.findIndex(s => s.addr === failedAddr);
   if (idx >= 0) pool.slots.splice(idx, 1);
   const failedCand = candidates.find(c => c.address === failedAddr);
-  if (failedCand) {
+  if (failedCand?.lockedBy === pool.keyId) {
     failedCand.lockedBy = '__cooldown__';
     setTimeout(() => {
       if (failedCand.lockedBy === '__cooldown__') failedCand.lockedBy = null;
@@ -1299,28 +1616,35 @@ async function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): Promise
 
   const lockedAddrs = new Set(pool.slots.map(s => s.addr));
   evictBlockedCandidates();
-  const available = candidates.filter(c => !c.lockedBy && !lockedAddrs.has(c.address));
+  const available = candidates.filter(c => !c.lockedBy && !lockedAddrs.has(c.address) && isExitUsable(c.address, undefined));
   const testLimit = Math.min(available.length, 75);
   const groupSize = 15;
   for (let i = 0; i < testLimit; i += groupSize) {
     const batch = available.slice(i, i + groupSize);
-    const results = await Promise.all(batch.map(async (c) => ({ cand: c, ...(await probe(c)) })));
+    const results = await Promise.all(batch.map(async (c) => {
+      const screen = await coarseScreen(c, admissionCeilingMs());
+      if (!screen.ok) return { cand: c, ok: false, latencyMs: screen.latencyMs };
+      recordScreenMeasurement(c, screen);
+      return { cand: c, ...(await probe(c)) };
+    }));
     for (const r of results) {
-      if (!r.ok && r.cand) {
-        r.cand.failCount = (r.cand.failCount || 0) + 1;
+      if (!r.ok && candidates.includes(r.cand) && !r.cand.lockedBy) {
+        recordCandidateFailure(r.cand);
       }
     }
-    const winner = results.find(r => r.ok);
+    const winner = results.find(r => r.ok && candidates.includes(r.cand) && !r.cand.lockedBy && isExitUsable(r.cand.address, undefined));
+    if (keySlotPools.get(pool.keyId) !== pool) return;
     if (winner && pool.slots.length < SLOTS_PER_KEY && !pool.slots.some(s => s.addr === winner.cand.address)) {
       const url = winner.cand.protocol === 'socks5' ? `socks5h://${winner.cand.address}` : `http://${winner.cand.address}`;
       const newSlot: Slot = {
         addr: winner.cand.address, url,
         proto: winner.cand.protocol as 'http' | 'socks5',
         latencyMs: winner.latencyMs || 0,
-        qualityGrade: winner.cand.quality_grade || 'C',
+        qualityGrade: gradeFromLatency(winner.latencyMs || 0),
       };
       pool.slots.push(newSlot);
       winner.cand.lockedBy = pool.keyId;
+      winner.cand.failCount = 0;
       console.log(`[Replace+] ${winner.cand.address} (${winner.latencyMs}ms) → Key ${pool.keyId.slice(0, 7)}...`);
       return;
     }
@@ -1328,7 +1652,11 @@ async function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): Promise
   console.log(`[Replace] ${failedAddr} failed, could not find replacement among ${testLimit} candidates`);
 }
 
+const keyPoolAllocations = new Map<string, Promise<KeySlotPool | null>>();
+
 async function getKeySlotPool(keyId: string): Promise<KeySlotPool | null> {
+  const pending = keyPoolAllocations.get(keyId);
+  if (pending) return pending;
   const existing = keySlotPools.get(keyId);
   if (existing) {
     existing.lastUsedAt = Date.now();
@@ -1347,10 +1675,15 @@ async function getKeySlotPool(keyId: string): Promise<KeySlotPool | null> {
     console.log(`[Allocate] Key ${keyId.slice(0, 7)}... Slots empty, re-allocating`);
     keySlotPools.delete(keyId);
   }
-  const pool = await allocateKeySlots(keyId);
-  if (!pool) return null;
-  keySlotPools.set(keyId, pool);
-  return pool;
+  const allocation = allocateKeySlots(keyId);
+  keyPoolAllocations.set(keyId, allocation);
+  try {
+    const pool = await allocation;
+    if (pool) keySlotPools.set(keyId, pool);
+    return pool;
+  } finally {
+    keyPoolAllocations.delete(keyId);
+  }
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1625,7 +1958,7 @@ function extractUsageFromResponse(respBody: string): { tokens: number; model: st
     const usage = parsed.usage;
     if (usage) {
       return {
-        tokens: usage.total_tokens || (usage.prompt_tokens || 0) + (usage.completion_tokens || 0),
+        tokens: usage.total_tokens || (usage.prompt_tokens ?? usage.input_tokens ?? 0) + (usage.completion_tokens ?? usage.output_tokens ?? 0),
         model,
       };
     }
@@ -1944,7 +2277,7 @@ function collectHeadersFromReq(nodeReq: http.IncomingMessage, bodyStr?: string):
   }
   h['authorization'] = 'Bearer public';
   h['x-opencode-client'] = 'cli';
-  h['user-agent'] = 'opencode/1.18.33 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14';
+  h['user-agent'] = h['user-agent']?.startsWith('opencode/') ? h['user-agent'] : OPENCODE_USER_AGENT;
   if (!h['content-type']) h['content-type'] = 'application/json';
 
   // Session: prefer client-provided, otherwise derive stableID from conversation seed
@@ -1967,6 +2300,8 @@ function collectHeadersFromReq(nodeReq: http.IncomingMessage, bodyStr?: string):
   h['x-opencode-session'] = FREE_TIER_AGENT_SHAPE
     ? canonicalSessionID(sessionSignal)
     : stableID('ses', sessionSignal);
+
+  for (const name of ['x-opencode-session-id', 'x-session-affinity', 'x-session-id']) h[name] = h['x-opencode-session'];
 
   // Request: unique per request
   if (!h['x-opencode-request']) h['x-opencode-request'] = randomID('req', 16);
@@ -2003,9 +2338,37 @@ function sendJson(nodeRes: http.ServerResponse, status: number, data: any) {
   nodeRes.end(body);
 }
 
-// Reassemble an OpenAI chat SSE stream into a single chat.completion object,
-// so a caller that asked for a non-streaming response still gets one even
-// though the upstream request had to be agent-shaped (stream: true).
+// Native Responses clients keep their response schema when stream:false.
+async function collectResponsesStream(stream: ReadableStream<Uint8Array>): Promise<{ status: number; body: string }> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let response: any;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+      for (const line of lines) {
+        if (!line.startsWith('data:')) continue;
+        let evt: any;
+        try { evt = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (evt.error || evt.type === 'error' || evt.type === 'response.failed') {
+          return { status: 502, body: JSON.stringify({ error: evt.error || evt.response?.error || { message: 'upstream stream error' } }) };
+        }
+        if (evt.type === 'response.completed' || evt.type === 'response.incomplete') response = evt.response;
+      }
+      if (done) break;
+    }
+    if (!response) throw new Error('upstream produced no final response');
+    return { status: 200, body: JSON.stringify(response) };
+  } catch (e: any) {
+    return { status: 502, body: JSON.stringify({ error: { message: e?.message || 'stream read failed' } }) };
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+}
+
+// Reassemble Chat SSE into JSON, including streamed function calls.
 async function collectChatStream(
   stream: ReadableStream<Uint8Array>,
   fallbackModel: string,
@@ -2018,6 +2381,7 @@ async function collectChatStream(
   let id = '';
   let created = 0;
   let finishReason = 'stop';
+  const toolCalls = new Map<number, any>();
   let promptTokens = 0, completionTokens = 0, totalTokens = 0;
 
   try {
@@ -2046,6 +2410,14 @@ async function collectChatStream(
           if (evt.created) created = evt.created;
           const delta = evt.choices?.[0]?.delta;
           if (typeof delta?.content === 'string') text += delta.content;
+          for (const call of delta?.tool_calls || []) {
+            const index = call.index ?? 0;
+            const accumulated = toolCalls.get(index) || { id: '', type: 'function', function: { name: '', arguments: '' } };
+            if (call.id) accumulated.id = call.id;
+            if (call.function?.name) accumulated.function.name += call.function.name;
+            if (call.function?.arguments) accumulated.function.arguments += call.function.arguments;
+            toolCalls.set(index, accumulated);
+          }
           if (evt.choices?.[0]?.finish_reason) finishReason = evt.choices?.[0]?.finish_reason;
           const u = evt.usage;
           if (u) {
@@ -2058,9 +2430,9 @@ async function collectChatStream(
     }
   } catch (e: any) {
     return { status: 502, body: JSON.stringify({ error: { message: e?.message || 'stream read failed' } }) };
-  }
+  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
 
-  if (!text && totalTokens === 0) {
+  if (!text && !toolCalls.size && totalTokens === 0) {
     return { status: 502, body: JSON.stringify({ error: { message: 'upstream produced no content' } }) };
   }
   return {
@@ -2070,28 +2442,16 @@ async function collectChatStream(
       object: 'chat.completion',
       created: created || Math.floor(Date.now() / 1000),
       model,
-      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: finishReason }],
+      choices: [{ index: 0, message: { role: 'assistant', content: text || (toolCalls.size ? null : ''),
+        ...(toolCalls.size ? { tool_calls: [...toolCalls.entries()].sort(([a], [b]) => a - b).map(([, call]) => call) } : {}) }, finish_reason: finishReason }],
       usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: totalTokens },
     }),
   };
 }
 
-// ── Responses-only models ──
-// These moved off /chat/completions upstream and answer with a bare
-// 500 "Internal server error" there, while /v1/responses serves them normally.
-// Same-key repro is documented upstream (opencode #44659, #44847, #45744) and
-// in FishBottle7/opencode2dsh#7. Callers keep speaking OpenAI chat to us; the
-// translation to Responses happens here and the reply is translated back.
-const RESPONSES_ONLY_MODELS = new Set([
-  'muse-spark-1.2-contributor',
-  'muse-spark-1.2-contributor-free',
-  'muse-spark-1.3-contributor',
-  'muse-spark-1.3-contributor-free',
-]);
-
+// Endpoint selection follows the same Zen metadata used by OpenCode2.
 function isResponsesOnlyModel(model: string | undefined): boolean {
-  if (!model) return false;
-  return RESPONSES_ONLY_MODELS.has(model) || RESPONSES_ONLY_MODELS.has(model.replace(/-free$/, ''));
+  return !!model && resolveCatalogModel(model, cachedModels)?.endpoint === 'responses';
 }
 
 // OpenAI chat body -> Responses body. Only the fields callers actually send are
@@ -2107,6 +2467,12 @@ function chatBodyToResponses(bodyStr: string): string | null {
   for (const m of messages) {
     if (!m || typeof m !== 'object') continue;
     const role = m.role;
+    if (role === 'tool') {
+      if (typeof m.tool_call_id !== 'string') return null;
+      input.push({ type: 'function_call_output', call_id: m.tool_call_id,
+        output: typeof m.content === 'string' ? m.content : JSON.stringify(m.content ?? '') });
+      continue;
+    }
     // Chat carries the system prompt as `system`; Responses expects it as a
     // `developer` turn inside the input array.
     const mapped = role === 'system' || role === 'developer' ? 'developer' : role;
@@ -2124,6 +2490,13 @@ function chatBodyToResponses(bodyStr: string): string | null {
         })
         .filter(Boolean);
       if (parts.length) input.push({ role: mapped, content: parts });
+    }
+    if (role === 'assistant' && Array.isArray(m.tool_calls)) {
+      for (const call of m.tool_calls) {
+        if (call?.type !== 'function' || typeof call.id !== 'string' || typeof call.function?.name !== 'string') return null;
+        input.push({ type: 'function_call', call_id: call.id, name: call.function.name,
+          arguments: call.function.arguments || '{}' });
+      }
     }
   }
   if (!input.length) return null;
@@ -2147,7 +2520,8 @@ function chatBodyToResponses(bodyStr: string): string | null {
     ));
   }
   if (!out.tools || !out.tools.length) out.tools = freeTierStubToolset(FREE_TIER_CORE_TOOLS);
-  if (src.tool_choice) out.tool_choice = src.tool_choice;
+  if (src.tool_choice) out.tool_choice = src.tool_choice?.function
+    ? { type: 'function', name: src.tool_choice.function.name } : src.tool_choice;
   if (src.reasoning_effort) out.reasoning = { effort: src.reasoning_effort };
   if (src.temperature != null) out.temperature = src.temperature;
   if (src.top_p != null) out.top_p = src.top_p;
@@ -2169,6 +2543,8 @@ function responsesSseToChatSse(
   let created = 0;
   let sentRole = false;
   let sentFinish = false;
+  const reader = upstream.getReader();
+  const calls = new Map<string, { index: number; id: string; name: string; arguments: string; announced: boolean }>();
 
   const chunk = (delta: any, finish: string | null, usage?: any) => JSON.stringify({
     id: responseId || 'chatcmpl-opencode2api',
@@ -2182,6 +2558,33 @@ function responsesSseToChatSse(
   return new ReadableStream<Uint8Array>({
     async start(controller) {
       const emit = (obj: string) => controller.enqueue(encoder.encode(`data: ${obj}\n\n`));
+      const ensureRole = () => {
+        if (!sentRole) { sentRole = true; emit(chunk({ role: 'assistant', content: '' }, null)); }
+      };
+      const tool = (key: string, item: any = {}) => {
+        let call = calls.get(key);
+        if (!call) {
+          call = { index: calls.size, id: item.call_id || key, name: item.name || '', arguments: '', announced: false };
+          calls.set(key, call);
+        }
+        if (item.call_id) call.id = item.call_id;
+        if (item.name) call.name = item.name;
+        return call;
+      };
+      const announce = (call: ReturnType<typeof tool>) => {
+        ensureRole();
+        if (call.announced) return;
+        call.announced = true;
+        emit(chunk({ tool_calls: [{ index: call.index, id: call.id, type: 'function', function: { name: call.name, arguments: '' } }] }, null));
+      };
+      const argumentsDone = (key: string, item: any) => {
+        const call = tool(key, item); announce(call);
+        const argumentsText = typeof item.arguments === 'string' ? item.arguments : '';
+        if (argumentsText.startsWith(call.arguments) && argumentsText.length > call.arguments.length) {
+          emit(chunk({ tool_calls: [{ index: call.index, function: { arguments: argumentsText.slice(call.arguments.length) } }] }, null));
+          call.arguments = argumentsText;
+        }
+      };
       const handle = (evt: any) => {
         const type = evt?.type;
         if (type === 'response.created' || type === 'response.in_progress') {
@@ -2190,6 +2593,28 @@ function responsesSseToChatSse(
           if (r.model) model = r.model;
           if (r.created_at) created = r.created_at;
           return;
+        }
+        if (type === 'response.output_item.added' && evt.item?.type === 'function_call') {
+          announce(tool(evt.item.id || String(evt.output_index), evt.item));
+          return;
+        }
+        if (type === 'response.function_call_arguments.delta') {
+          const call = tool(evt.item_id || String(evt.output_index)); announce(call);
+          if (typeof evt.delta === 'string') {
+            call.arguments += evt.delta;
+            emit(chunk({ tool_calls: [{ index: call.index, function: { arguments: evt.delta } }] }, null));
+          }
+          return;
+        }
+        if (type === 'response.output_item.done' && evt.item?.type === 'function_call') {
+          argumentsDone(evt.item.id || String(evt.output_index), evt.item); return;
+        }
+        if (type === 'response.function_call_arguments.done') {
+          argumentsDone(evt.item_id || String(evt.output_index), evt); return;
+        }
+        if (type === 'error' || type === 'response.failed' || evt.error) {
+          emit(JSON.stringify({ error: evt.error || evt.response?.error || { message: 'responses stream failed' } }));
+          sentFinish = true; controller.close(); return;
         }
         if (type === 'response.output_text.delta') {
           if (!sentRole) { sentRole = true; emit(chunk({ role: 'assistant', content: '' }, null)); }
@@ -2200,19 +2625,21 @@ function responsesSseToChatSse(
           if (!sentRole) { sentRole = true; emit(chunk({ role: 'assistant', content: '' }, null)); }
           if (sentFinish) return;
           sentFinish = true;
+          for (const item of evt.response?.output || []) {
+            if (item.type === 'function_call') argumentsDone(item.id || item.call_id, item);
+          }
           const u = evt.response?.usage;
           const usage = u ? {
             prompt_tokens: u.input_tokens ?? 0,
             completion_tokens: u.output_tokens ?? 0,
             total_tokens: u.total_tokens ?? ((u.input_tokens ?? 0) + (u.output_tokens ?? 0)),
           } : undefined;
-          emit(chunk({}, 'stop', usage));
+          emit(chunk({}, calls.size ? 'tool_calls' : (type === 'response.incomplete' ? 'length' : 'stop'), usage));
           controller.enqueue(encoder.encode('data: [DONE]\n\n'));
           controller.close();
         }
       };
 
-      const reader = upstream.getReader();
       try {
         for (;;) {
           const { done, value } = await reader.read();
@@ -2243,7 +2670,7 @@ function responsesSseToChatSse(
         try { controller.close(); } catch {}
       }
     },
-    cancel(reason) { /* upstream reader is cancelled by the loop above */ },
+    cancel(reason) { return reader.cancel(reason); },
   });
 }
 
@@ -2271,143 +2698,187 @@ function requireAdmin(nodeReq: http.IncomingMessage, nodeRes: http.ServerRespons
   return ok;
 }
 
-function fetchJsonDirect(url: string, timeoutMs: number): Promise<any> {
+// Bound the complete transfer, including stalled bodies. A malformed or HTTP
+// error response must never replace a working catalog with an empty one.
+function fetchJsonDirect(url: string, timeoutMs: number, options: https.RequestOptions = {}): Promise<any> {
   return new Promise((resolve, reject) => {
-    const req = https.request(url, {
+    let settled = false;
+    let req: http.ClientRequest;
+    const finish = (error?: Error, value?: any) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(deadline);
+      if (error) { req?.destroy(); reject(error); }
+      else resolve(value);
+    };
+    const deadline = setTimeout(() => finish(new Error('timeout')), timeoutMs);
+    req = https.request(url, {
+      ...options,
       method: 'GET',
-      headers: { accept: 'application/json', 'user-agent': 'opencode2api' },
-      rejectUnauthorized: false,
-      timeout: timeoutMs,
+      headers: { accept: 'application/json', 'user-agent': OPENCODE_USER_AGENT, ...options.headers },
     }, (res) => {
       const chunks: Buffer[] = [];
-      res.on('data', (c: Buffer) => chunks.push(c));
+      let size = 0;
+      res.on('data', (c: Buffer) => {
+        size += c.length;
+        if (size > 16 * 1024 * 1024) { finish(new Error('catalog response too large')); return; }
+        chunks.push(c);
+      });
+      res.on('error', (e) => finish(e));
+      res.on('aborted', () => finish(new Error('catalog response aborted')));
       res.on('end', () => {
-        try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
-        } catch (e: any) {
-          reject(new Error(`bad-json: ${e?.message || e}`));
-        }
+        if (settled) return;
+        if (res.statusCode !== 200) { finish(new Error(`catalog HTTP ${res.statusCode}`)); return; }
+        try { finish(undefined, JSON.parse(Buffer.concat(chunks).toString('utf-8'))); }
+        catch { finish(new Error('invalid catalog JSON')); }
       });
     });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    req.on('error', (e) => finish(e));
     req.end();
   });
 }
 
-async function fetchModelsDevFreeIds(): Promise<Set<string> | null> {
-  if (modelsDevFreeIds && Date.now() - modelsDevTime < MODELS_DEV_TTL_MS) {
-    return modelsDevFreeIds;
-  }
-  const doc: any = await fetchJsonDirect(MODELS_DEV_URL, 10000);
-  const models = doc?.opencode?.models || {};
-  const free = new Set<string>();
-  for (const [id, m] of Object.entries<any>(models)) {
-    const cost = (m as any)?.cost;
-    if (cost && cost.input === 0 && cost.output === 0) free.add(id);
-  }
-  modelsDevFreeIds = free;
+async function fetchModelsDevMetadata(): Promise<any> {
+  if (modelsDevMetadata && Date.now() - modelsDevTime < MODELS_DEV_TTL_MS) return modelsDevMetadata;
+  const doc = await fetchJsonDirect(MODELS_DEV_URL, 10000);
+  // Validate the provider document before caching it.
+  buildZenCatalog({ data: [] }, doc);
+  modelsDevMetadata = { opencode: doc.opencode };
   modelsDevTime = Date.now();
-  return free;
+  return modelsDevMetadata;
 }
 
-function isFreeBySuffix(id: string): boolean {
-  return id.endsWith('-free') || id === 'big-pickle';
-}
-
-
-async function fetchModelsFromUpstream(): Promise<any[]> {
-  let agent: https.Agent | undefined;
-  if (warpSlot) {
-    agent = new SocksProxyAgent(warpSlot.url, { timeout: 10000 }) as unknown as https.Agent;
+function applyModelCatalog(upstream: any, metadata: any, checkedAt: number): ZenModel[] {
+  const catalog = buildZenCatalog(upstream, metadata);
+  // A mismatched feed is a discovery failure. Known models becoming paid or
+  // deprecated is a valid empty catalog and must immediately withdraw them.
+  if (!catalog.models.length && !upstream.data.some((m: any) => typeof m?.id === 'string' && metadata.opencode.models[m.id])) {
+    throw new Error('upstream model IDs do not match Zen metadata');
   }
-  const result = await new Promise<any>((resolve, reject) => {
-    const req = https.request(`${UPSTREAM}/v1/models`, {
-      method: 'GET',
-      headers: {
-        accept: 'application/json',
-        authorization: 'Bearer public',
-        'x-opencode-client': 'desktop',
-        'x-opencode-session': canonicalSessionID(`models-${Date.now()}`),
-        'user-agent': 'opencode',
-      },
-      agent,
-      rejectUnauthorized: false,
-      timeout: 10000,
-    }, (res) => {
-      const chunks: Buffer[] = [];
-      res.on('data', (c: Buffer) => chunks.push(c));
-      res.on('end', () => {
-        try {
-          resolve(JSON.parse(Buffer.concat(chunks).toString('utf-8')));
-        } catch {
-          resolve({ data: [] });
-        }
-      });
-    });
-    req.on('error', reject);
-    req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-    req.end();
-  });
-  const upstreamList: any[] = result.data || [];
-  let freeModels: any[];
+  cachedModels = catalog.models;
+  cachedModelsTime = checkedAt;
+  catalogExcluded = catalog.excluded;
+  const canonical = new Set(cachedModels.map(m => m.canonical_id || m.id));
+  for (const id of freeModelHealth.keys()) if (!canonical.has(id)) freeModelHealth.delete(id);
+  return cachedModels;
+}
+
+function loadModelCatalog(): void {
   try {
-    const freeSet = await fetchModelsDevFreeIds();
-    if (freeSet) {
-      freeModels = upstreamList.filter((m: any) => m.id && freeSet.has(m.id));
-    } else {
-      freeModels = upstreamList.filter((m: any) => m.id && isFreeBySuffix(String(m.id)));
-    }
-  } catch (e: any) {
-    console.warn(`[Models] models.dev lookup failed, suffix fallback: ${e?.message || e}`);
-    freeModels = upstreamList.filter((m: any) => m.id && isFreeBySuffix(String(m.id)));
-  }
-  // Add convenient aliases if target model is present
-  const aliasMap: Record<string, string> = {
-    'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
-    'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
-  };
-  for (const [aliasId, canonicalId] of Object.entries(aliasMap)) {
-    const target = freeModels.find((m: any) => m.id === canonicalId);
-    if (target && !freeModels.some((m: any) => m.id === aliasId)) {
-      freeModels.push({
-        id: aliasId,
-        object: 'model',
-        created: target.created,
-        owned_by: target.owned_by || 'opencode',
-      });
-    }
-  }
-
-  cachedModels = freeModels;
-  cachedModelsTime = Date.now();
-  return freeModels;
+    const doc = JSON.parse(fs.readFileSync(MODEL_CATALOG_FILE, 'utf8'));
+    const age = Date.now() - doc.checkedAt;
+    if (doc.version !== 1 || doc.upstream !== UPSTREAM || !Number.isFinite(age) || age < 0 || age > MODEL_CATALOG_MAX_STALE_MS) return;
+    applyModelCatalog(doc.models, doc.metadata, doc.checkedAt);
+    console.log(`[Models] Loaded last successful Zen catalog (${cachedModels.length} IDs)`);
+  } catch { /* Missing, invalid or expired state is rediscovered online. */ }
 }
 
-// Cheapest possible call that still exercises the real path: one token, no
-// proxy, so reachability is measured without spending a slot or compounding
-// upstream rate limits. Aliases resolve to their canonical ID first, otherwise
-// an alias is probed as a model that does not exist upstream.
-function resolveAliasId(model: string): string {
-  const ALIAS: Record<string, string> = {
-    'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
-    'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
+function catalogStatus() {
+  return {
+    provider: 'opencode',
+    checkedAt: cachedModelsTime || null,
+    stale: Date.now() - cachedModelsTime >= MODEL_CATALOG_TTL_MS,
+    lastError: catalogLastError || null,
+    excluded: catalogExcluded,
   };
-  return ALIAS[model] || model;
+}
+
+async function fetchModelsFromUpstream(): Promise<ZenModel[]> {
+  if (catalogRefresh) return catalogRefresh;
+  const canUseCache = () => cachedModelsTime > 0 && Date.now() - cachedModelsTime <= MODEL_CATALOG_MAX_STALE_MS;
+  if (catalogLastError && Date.now() - catalogLastAttempt < MODEL_CATALOG_RETRY_MS) {
+    if (canUseCache()) return cachedModels;
+    throw new Error(catalogLastError);
+  }
+  catalogLastAttempt = Date.now();
+  catalogRefresh = (async () => {
+    try {
+      const agent = warpSlot ? new SocksProxyAgent(warpSlot.url, { timeout: 10000 }) as unknown as https.Agent : undefined;
+      const [upstream, metadata] = await Promise.all([
+        fetchJsonDirect(`${UPSTREAM}/v1/models`, 10000, {
+          agent,
+          headers: { authorization: 'Bearer public', 'x-opencode-client': 'cli',
+            'x-opencode-session': canonicalSessionID('opencode2api-models') },
+        }),
+        fetchModelsDevMetadata(),
+      ]);
+      // Empty lists are not successful discovery; retain the previous catalog.
+      if (!Array.isArray(upstream?.data) || !upstream.data.length) throw new Error('empty or invalid upstream model catalog');
+      applyModelCatalog(upstream, metadata, Date.now());
+      catalogLastError = '';
+      try {
+        const tmp = `${MODEL_CATALOG_FILE}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify({ version: 1, upstream: UPSTREAM, checkedAt: cachedModelsTime, models: upstream, metadata }));
+        fs.renameSync(tmp, MODEL_CATALOG_FILE);
+      } catch (e: any) { console.warn(`[Models] Could not persist catalog: ${e?.message || e}`); }
+      return cachedModels;
+    } catch (e: any) {
+      catalogLastError = e?.message || String(e);
+      if (canUseCache()) {
+        console.warn(`[Models] Refresh failed, retaining last successful Zen catalog: ${catalogLastError}`);
+        return cachedModels;
+      }
+      throw e;
+    }
+  })();
+  try { return await catalogRefresh; } finally { catalogRefresh = null; }
+}
+
+async function ensureModelCatalog(): Promise<ZenModel[]> {
+  if (cachedModelsTime > 0 && Date.now() - cachedModelsTime < MODEL_CATALOG_TTL_MS) return cachedModels;
+  return fetchModelsFromUpstream();
+}
+
+function resolveAliasId(model: string): string {
+  const selected = resolveCatalogModel(model, cachedModels);
+  return selected?.canonical_id || selected?.id || model;
+}
+
+function getModelHealth(model: string): ModelHealth | undefined {
+  return freeModelHealth.get(resolveAliasId(model));
+}
+
+// Reject empty HTTP 200 streams and provider errors carried inside SSE.
+function hasModelOutput(body: string): boolean {
+  const docs: any[] = [];
+  try { docs.push(JSON.parse(body)); } catch {
+    for (const line of body.split(/\r?\n/)) {
+      if (!line.startsWith('data:')) continue;
+      try { docs.push(JSON.parse(line.slice(5).trim())); } catch {}
+    }
+  }
+  if (docs.some(d => d?.error || d?.type === 'error' || d?.type === 'response.failed')) return false;
+  return docs.some(d => {
+    const response = d?.response || d;
+    return (d?.type === 'response.output_text.delta' && !!d.delta)
+      || response?.output?.some((o: any) => o?.content?.some((c: any) => !!c?.text) || o?.type === 'function_call')
+      || response?.choices?.some((c: any) => !!(c?.delta?.content || c?.delta?.reasoning_content || c?.delta?.tool_calls?.length || c?.message?.content || c?.message?.tool_calls?.length))
+      || (response?.usage?.completion_tokens > 0 || response?.usage?.output_tokens > 0);
+  });
 }
 
 async function probeFreeModel(model: string): Promise<ModelHealth> {
-  const prev = freeModelHealth.get(model);
+  const prev = getModelHealth(model);
   const target = resolveAliasId(model);
   let status = 0;
   let reason = '';
   try {
     const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      let req: http.ClientRequest;
+      let finished = false;
+      const finish = (error?: Error, value?: { status: number; body: string }) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(deadline);
+        if (error) { req?.destroy(); reject(error); }
+        else resolve(value!);
+      };
+      const deadline = setTimeout(() => finish(new Error('probe timeout')), 20000);
       const payload = (() => {
         const base = {
           model: target,
           messages: [{ role: 'user', content: 'hi' }],
-          max_tokens: 8,
+          max_tokens: 128,
           stream: false,
         };
         // The probe must use the same shape as real traffic. A non-streaming,
@@ -2420,7 +2891,7 @@ async function probeFreeModel(model: string): Promise<ModelHealth> {
           return JSON.stringify({
             model: target,
             input: [{ role: 'user', content: 'hi' }],
-            max_output_tokens: 16,
+            max_output_tokens: 128,
             stream: true,
             store: false,
             tools: freeTierStubToolset(FREE_TIER_CORE_TOOLS).map((t: any) => ({
@@ -2437,7 +2908,7 @@ async function probeFreeModel(model: string): Promise<ModelHealth> {
         });
       })();
       const probePath = isResponsesOnlyModel(target) ? '/v1/responses' : '/v1/chat/completions';
-      const req = https.request(`${UPSTREAM}${probePath}`, {
+      req = https.request(`${UPSTREAM}${probePath}`, {
         method: 'POST',
         headers: {
           'content-type': 'application/json',
@@ -2447,7 +2918,7 @@ async function probeFreeModel(model: string): Promise<ModelHealth> {
           'x-opencode-session': canonicalSessionID(`probe-${model}`),
           'x-opencode-request': randomID('probe', 8),
           'x-opencode-project': 'opencode2api',
-          'user-agent': 'opencode/1.18.33 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14',
+          'user-agent': OPENCODE_USER_AGENT,
           'content-length': Buffer.byteLength(payload),
         },
         rejectUnauthorized: false,
@@ -2455,24 +2926,27 @@ async function probeFreeModel(model: string): Promise<ModelHealth> {
       }, (res) => {
         const chunks: Buffer[] = [];
         res.on('data', (c: Buffer) => chunks.push(c));
-        res.on('end', () => resolve({
+        res.on('error', (e) => finish(e));
+        res.on('aborted', () => finish(new Error('probe aborted')));
+        res.on('end', () => finish(undefined, {
           status: res.statusCode || 0,
           body: Buffer.concat(chunks).toString('utf-8'),
         }));
       });
-      req.on('error', reject);
-      req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+      req.on('error', (e) => finish(e));
+      req.on('timeout', () => finish(new Error('timeout')));
       req.end(payload);
     });
     status = result.status;
+    if (status === 200 && !hasModelOutput(result.body)) { status = 502; reason = 'upstream produced no valid model output'; }
     if (status >= 200 && status < 400) {
       reason = 'ok';
     } else {
       try {
         const doc: any = JSON.parse(result.body);
-        reason = doc?.error?.message || doc?.message || `HTTP ${status}`;
+        reason = doc?.error?.message || doc?.message || reason || `HTTP ${status}`;
       } catch {
-        reason = `HTTP ${status}`;
+        reason = reason || `HTTP ${status}`;
       }
     }
   } catch (e: any) {
@@ -2504,7 +2978,7 @@ async function probeFreeModel(model: string): Promise<ModelHealth> {
       checkedAt: Date.now(),
     };
   }
-  freeModelHealth.set(model, health);
+  freeModelHealth.set(target, health);
   return health;
 }
 
@@ -2512,16 +2986,17 @@ async function verifyFreeModels(): Promise<void> {
   if (verifyingModels) return;
   verifyingModels = true;
   try {
-    const ids = cachedModels.map(m => m.id).filter(Boolean);
+    await ensureModelCatalog();
+    const ids = [...new Set(cachedModels.map(m => m.canonical_id || m.id))];
     for (let i = 0; i < ids.length; i += MODEL_VERIFY_CONCURRENCY) {
       await Promise.all(ids.slice(i, i + MODEL_VERIFY_CONCURRENCY).map(probeFreeModel));
     }
-    // One retry for probes that learned nothing (timeout / 429 / no verdict).
+    // One retry for transport failures. Never immediately retry a 429.
     // Cheap, and it stops a transient blip from leaving a healthy model
     // unclassified until the next 30-minute interval.
     const inconclusive = ids.filter(id => {
       const h = freeModelHealth.get(id);
-      return !h || h.verdict === 'unknown';
+      return !h || (h.verdict === 'unknown' && h.status === 0);
     });
     if (inconclusive.length) {
       console.log(`[Models] retrying ${inconclusive.length} inconclusive probe(s)`);
@@ -2562,14 +3037,13 @@ async function verifyFreeModels(): Promise<void> {
 function workingFreeModelIds(): string[] {
   const ids = cachedModels.map(m => m.id).filter(Boolean);
   if (!modelsVerified && freeModelHealth.size === 0) return ids;
-  return ids.filter(id => freeModelHealth.get(id)?.verdict !== 'dead');
+  return ids.filter(id => getModelHealth(id)?.verdict !== 'dead');
 }
 
-function pickWorkingModel(): string | null {
-  // verification pass it contains only confirmed-healthy models, and before one
-  // it falls back to the upstream list. Either way the first entry is the best
-  // available substitute.
-  return workingFreeModelIds()[0] || null;
+function pickWorkingModel(endpoint?: 'responses'): string | null {
+  // Prefer confirmed healthy models, then unconfirmed catalog members.
+  const ids = workingFreeModelIds().filter(id => !endpoint || isResponsesOnlyModel(id));
+  return ids.find(id => getModelHealth(id)?.verdict === 'healthy') || ids[0] || null;
 }
 
 // Side-channel for the dashboard: which IDs are actually callable and why the
@@ -2583,7 +3057,7 @@ function modelAvailability(): { callableIds: string[]; withheld: { id: string; v
     withheld: ids
       .filter(id => !callable.has(id))
       .map(id => {
-        const h = freeModelHealth.get(id);
+        const h = getModelHealth(id);
         return {
           id,
           verdict: h?.verdict || 'unknown',
@@ -2602,47 +3076,27 @@ function modelAvailability(): { callableIds: string[]; withheld: { id: string; v
 // Also routes around models verified dead: a caller asking for one gets a
 // working free model instead of the upstream's raw 400/403/500, and the swap is
 // reported on the response so it is never silent.
-function normalizeFreeModelAlias(bodyStr: string | undefined): { body?: string; substitutedFrom?: string; substitutedTo?: string } {
-  if (!bodyStr) return { body: bodyStr };
+function normalizeFreeModelAlias(bodyStr: string | undefined, endpoint?: 'responses'): { body?: string; substitutedFrom?: string; substitutedTo?: string; error?: string } {
   try {
-    bodyStr = patchMissingReasoningContent(bodyStr);
-    const parsed = JSON.parse(bodyStr);
-    const model = parsed?.model;
+    const parsed = JSON.parse(patchMissingReasoningContent(bodyStr || ''));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed) || typeof parsed.model !== 'string') {
+      return { error: 'Request must include a model from /v1/models' };
+    }
+    const selected = resolveCatalogModel(parsed.model, cachedModels);
+    if (!selected) return { error: `Unsupported free Zen model: ${parsed.model}. See /v1/models.` };
+    parsed.model = selected.canonical_id || selected.id;
     let substitutedFrom: string | undefined;
     let substitutedTo: string | undefined;
-    if (typeof model === 'string' && model) {
-      const KNOWN_EXPLICIT_ALIASES: Record<string, string> = {
-        'muse-spark-1.3': 'muse-spark-1.3-contributor-free',
-        'muse-spark-1.3-free': 'muse-spark-1.3-contributor-free',
-        'muse-spark-1.2': 'muse-spark-1.2-contributor-free',
-        'muse-spark-1.2-free': 'muse-spark-1.2-contributor-free',
-        'ling-3.0-flash-fin': 'ling-3.0-flash-fin-free',
-      };
-      if (KNOWN_EXPLICIT_ALIASES[model]) {
-        parsed.model = KNOWN_EXPLICIT_ALIASES[model];
-      } else if (model !== 'big-pickle' && !model.endsWith('-free')) {
-        const want = `${model}-free`;
-        if (cachedModels.some((m: any) => m.id === want)) parsed.model = want;
+    if (getModelHealth(parsed.model)?.verdict === 'dead') {
+      const replacement = pickWorkingModel(endpoint);
+      if (replacement) {
+        substitutedFrom = parsed.model;
+        substitutedTo = resolveAliasId(replacement);
+        parsed.model = substitutedTo;
       }
-      // Dead-model routing, applied after alias resolution so the verdict is
-      // looked up under the canonical ID.
-      const resolved = String(parsed.model);
-      if (freeModelHealth.get(resolved)?.verdict === 'dead') {
-        const replacement = pickWorkingModel();
-        if (replacement && replacement !== resolved) {
-          substitutedFrom = resolved;
-          substitutedTo = replacement;
-          parsed.model = replacement;
-        }
-      }
-    }
-    if (parsed?.stream === true && parsed.stream_options === undefined) {
-      parsed.stream_options = { include_usage: true };
     }
     return { body: JSON.stringify(parsed), substitutedFrom, substitutedTo };
-  } catch {
-    return { body: bodyStr };
-  }
+  } catch { return { error: 'Invalid JSON request' }; }
 }
 
 const server = http.createServer(async (nodeReq, nodeRes) => {
@@ -2725,6 +3179,19 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       candidates: candidates.length,
       customSlotsCount: customSlots.length,
       totalApiKeys: Object.keys(apiKeys).length,
+      pool: {
+        state: currentPoolState(),
+        freeExits: freeExitCount(),
+        target: POOL_TARGET,
+        admitCeilingMs: admissionCeilingMs(),
+        validatedTotal: validatedExits.size,
+        grades: candidates.reduce((acc: any, c) => {
+          if (c.lockedBy || !isExitUsable(c.address, undefined) || !isValidated(c.address)) return acc;
+          const g = gradeFromLatency(c.latency ?? 9999);
+          acc[g] = (acc[g] || 0) + 1;
+          return acc;
+        }, {} as Record<string, number>),
+      },
     });
     return;
   }
@@ -2797,23 +3264,15 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
     return;
   }
 
-  // –– Fetch model list from upstream, filter free models, and cache ––
-  // /v1/models only carries id/object/created/owned_by (no free flag), so the
-  // `-free` suffix alone misses stealth free models like `big-pickle`.
-  // Better way: join live upstream availability with models.dev pricing
-  // (.opencode.models[id].cost == 0/0 means free). Falls back to the
-  // opencodex rule (`-free` suffix or `big-pickle`) when models.dev is
-  // unreachable. Advertised IDs keep their upstream-original form so they
-  // stay callable; stripped aliases are normalized on the chat path below.
-// –– API: Models ––
+  // –– API: Zen model catalog and live availability ––
   if (pathname === '/api/models' && method === 'GET') {
     try {
-      if (cachedModels.length > 0 && Date.now() - cachedModelsTime < 300000) {
-        sendJson(nodeRes, 200, { models: cachedModels, ...modelAvailability() });
+      if (cachedModelsTime > 0 && Date.now() - cachedModelsTime < MODEL_CATALOG_TTL_MS) {
+        sendJson(nodeRes, 200, { models: cachedModels, ...modelAvailability(), catalog: catalogStatus() });
         return;
       }
       const freeModels = await fetchModelsFromUpstream();
-      sendJson(nodeRes, 200, { models: freeModels, ...modelAvailability() });
+      sendJson(nodeRes, 200, { models: freeModels, ...modelAvailability(), catalog: catalogStatus() });
     } catch (e: any) {
       sendJson(nodeRes, 502, { error: e.message });
     }
@@ -3263,10 +3722,24 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       return;
     }
 
-    acquireKey(authKey);
     const startTime = Date.now();
 
-    let bodyStr = method !== 'GET' && method !== 'HEAD' ? await readBody(nodeReq) : undefined;
+    const isGeneration = upstreamPath === '/v1/chat/completions' || upstreamPath === '/v1/responses';
+    if (!((upstreamPath === '/v1/models' && method === 'GET') || (isGeneration && method === 'POST'))) {
+      sendJson(nodeRes, 404, { error: 'unsupported_endpoint', message: 'Use /v1/models, /v1/chat/completions or /v1/responses' });
+      return;
+    }
+    let bodyStr: string | undefined;
+    try {
+      if (isGeneration) { await ensureModelCatalog(); bodyStr = await readBody(nodeReq); }
+    } catch (e: any) {
+      sendJson(nodeRes, 503, { error: 'model_catalog_unavailable', message: e?.message || String(e) });
+      return;
+    }
+    if (isGeneration && !bodyStr) {
+      sendJson(nodeRes, 400, { error: 'invalid_request_error', message: 'JSON request body required' });
+      return;
+    }
     let substitutedFrom: string | undefined;
     let substitutedTo: string | undefined;
     // Whether the caller asked for SSE. The agent shape forces stream:true
@@ -3274,14 +3747,22 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
     // back into a single JSON completion rather than being handed a stream.
     let callerWantsStream = false;
     if (bodyStr && (upstreamPath.includes('/chat/completions') || upstreamPath.includes('/responses'))) {
-      const normalized = normalizeFreeModelAlias(bodyStr);
+      const normalized = normalizeFreeModelAlias(bodyStr, upstreamPath === '/v1/responses' ? 'responses' : undefined);
+      if (normalized.error) {
+        sendJson(nodeRes, 400, { error: 'invalid_request_error', message: normalized.error });
+        return;
+      }
       bodyStr = normalized.body;
+      if (upstreamPath === '/v1/responses' && !isResponsesOnlyModel(JSON.parse(bodyStr!).model)) {
+        sendJson(nodeRes, 400, { error: 'unsupported_transport', message: 'This model uses /v1/chat/completions' });
+        return;
+      }
       substitutedFrom = normalized.substitutedFrom;
       substitutedTo = normalized.substitutedTo;
       if (substitutedFrom) {
         console.log(`[Models] ${substitutedFrom} is dead upstream, serving ${substitutedTo} instead`);
       }
-      const shaped = shapeAgentRequest(bodyStr as string);
+      const shaped = shapeAgentRequest(bodyStr as string, upstreamPath === '/v1/responses' ? 'responses' : 'chat');
       bodyStr = shaped.body;
       callerWantsStream = shaped.callerWantsStream;
       if (shaped.reshaped) {
@@ -3299,6 +3780,10 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       try { resolvedModel = (JSON.parse(bodyStr) as any)?.model || ''; } catch {}
       if (isResponsesOnlyModel(resolvedModel)) {
         const translated = chatBodyToResponses(bodyStr);
+        if (!translated) {
+          sendJson(nodeRes, 400, { error: 'invalid_request_error', message: 'Chat messages cannot be translated to Responses' });
+          return;
+        }
         if (translated) {
           usedResponses = true;
           responsesFallbackModel = resolvedModel;
@@ -3309,16 +3794,21 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       }
     }
     const reqHeaders = collectHeadersFromReq(nodeReq, bodyStr);
+    // Recheck immediately before reservation: catalog/body awaits above may
+    // have admitted another request or allowed a key to expire/be disabled.
+    const admission = validateKey(authKey);
+    if (!admission.ok) {
+      sendJson(nodeRes, 403, { error: 'forbidden', message: admission.reason });
+      return;
+    }
+    acquireKey(authKey);
+    if (isGeneration) recordKeyRequest(authKey);
 
-    // Intercept /v1/models → return cached free models (no slot allocation needed).
-    // Only models confirmed callable are advertised. Measured upstream: 11 of
-    // the 12 free IDs fail on a direct proxyless request (7× 403 tier lock,
-    // 1× 400 unavailable, 3× 500), so listing them as available is what made
-    // the pool look healthy and fail on first use.
+    // Catalog requests use no proxy slots; aliases share canonical health.
     if (upstreamPath === '/v1/models' && method === 'GET') {
       try {
         let list = cachedModels;
-        if (list.length === 0 || Date.now() - cachedModelsTime >= 300000) {
+        if (cachedModelsTime === 0 || Date.now() - cachedModelsTime >= MODEL_CATALOG_TTL_MS) {
           list = await fetchModelsFromUpstream();
         }
         const callables = workingFreeModelIds()
@@ -3330,12 +3820,13 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
         const withheld = list
           .filter(m => !advertised.some(a => a.id === m.id))
           .map(m => {
-            const h = freeModelHealth.get(m.id);
+            const h = getModelHealth(m.id);
             return { id: m.id, status: h?.status ?? 0, reason: h?.reason || 'unverified' };
           });
         sendJson(nodeRes, 200, {
           object: 'list',
           data: advertised,
+          catalog: catalogStatus(),
           ...(withheld.length ? { withheld_unavailable: withheld } : {}),
         });
         releaseKey(authKey);
@@ -3376,7 +3867,9 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
           const requestedModel = (() => {
             try { return (JSON.parse(bodyStr || '{}') as any)?.model || ''; } catch { return ''; }
           })();
-          const collected = await collectChatStream(result.stream, substitutedTo || requestedModel);
+          const collected = upstreamPath === '/v1/responses' && !usedResponses
+            ? await collectResponsesStream(result.stream)
+            : await collectChatStream(result.stream, substitutedTo || requestedModel);
           const usage = extractUsageFromResponse(collected.body);
           if (usage.tokens > 0) recordKeyUsage(authKey, usage.tokens);
           nodeRes.writeHead(collected.status, {
@@ -3415,7 +3908,9 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
           clientClosed = true;
           reader.cancel().catch(() => {});
         });
-        let streamTailBuf = '';
+        let streamUsageBuffer = '';
+        let streamTokens = 0;
+        const streamDecoder = new TextDecoder();
         try {
           while (!clientClosed) {
             const { done, value } = await reader.read();
@@ -3425,21 +3920,24 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
               (nodeRes as any).flush();
             }
             if (value && value.length > 0) {
-              const chunkStr = new TextDecoder().decode(value);
-              streamTailBuf = (streamTailBuf + chunkStr).slice(-2048);
+              streamUsageBuffer += streamDecoder.decode(value, { stream: true });
+              const lines = streamUsageBuffer.split(/\r?\n/);
+              streamUsageBuffer = lines.pop() || '';
+              for (const line of lines) {
+                if (!line.startsWith('data:')) continue;
+                try {
+                  const evt = JSON.parse(line.slice(5).trim());
+                  const usage = evt.usage || evt.response?.usage;
+                  if (usage) streamTokens = usage.total_tokens ?? ((usage.input_tokens || 0) + (usage.output_tokens || 0));
+                } catch {}
+              }
             }
           }
         } catch (err: any) {
           console.warn(`[Dispatch] Stream read interrupted:`, err?.message || err);
         } finally {
           nodeRes.end();
-          try {
-            const usageMatch = streamTailBuf.match(/"usage"\s*:\s*\{[^}]*"total_tokens"\s*:\s*(\d+)/);
-            if (usageMatch) {
-              const tokens = parseInt(usageMatch[1], 10);
-              if (tokens > 0) recordKeyUsage(authKey, tokens);
-            }
-          } catch {}
+          if (streamTokens > 0) recordKeyUsage(authKey, streamTokens);
         }
       } else {
         // Standard response. This is the single place token accounting happens:
@@ -3480,6 +3978,13 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
 setInterval(() => {
   refreshCandidates();
 }, PROXY_REFRESH_MS);
+
+// Continuously re-validate exits. Allocation-time probing alone cannot see a
+// proxy that died after it was handed to a key, so a live pool would keep
+// handing out dead exits until real traffic failed on them.
+setInterval(() => {
+  backgroundProbeSweep();
+}, PROBER_INTERVAL_MS);
 
 // Periodically clean up expired/idle Key Slot Pools
 setInterval(() => {
@@ -3566,6 +4071,12 @@ async function main() {
 
   // Initialize custom proxies
   await initCustomSlots();
+
+  // Re-validate exits shortly after boot so the first allocation already knows
+  // which proxies are alive instead of discovering it one request at a time.
+  setTimeout(() => { backgroundProbeSweep(); }, 20_000);
+
+  loadModelCatalog();
 
   // Discover free models and establish which are actually callable. Runs
   // before the listener comes up so the first caller does not race an
