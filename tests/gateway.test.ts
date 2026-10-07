@@ -706,6 +706,30 @@ describe('Zen discovery and health', () => {
     expect((await pending).status).toBe(0);
   });
 
+  test('agent shaping preserves client tools and appends missing core tools', () => {
+    const g = fixture();
+    const shaped = g.shapeAgentRequest(JSON.stringify({
+      model: 'big-pickle',
+      messages: [{ role: 'user', content: 'hello' }],
+      stream: true,
+      stream_options: { include_usage: true },
+      tools: [{
+        type: 'function',
+        function: {
+          name: 'read',
+          description: 'Pi read tool',
+          parameters: { type: 'object', properties: { path: { type: 'string' } } },
+        },
+      }],
+    }), 'chat');
+    const body = JSON.parse(shaped.body);
+    const names = body.tools.map((tool: any) => tool.function?.name || tool.name);
+    expect(shaped.reshaped).toBe(true);
+    expect(names.filter((name: string) => name === 'read')).toHaveLength(1);
+    for (const name of ['bash', 'edit', 'glob', 'grep', 'read']) expect(names).toContain(name);
+    expect(body.tools.find((tool: any) => tool.function?.name === 'read').function.description).toBe('Pi read tool');
+  });
+
   test('native headers retain session affinity and current client version', () => {
     const g = fixture();
     const session = 'ses_f02a200f4fferWXQQFP3o9w8x9';

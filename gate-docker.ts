@@ -470,11 +470,14 @@ function shapeAgentRequest(
 
   if (endpoint === 'responses' && parsed.stream_options) { delete parsed.stream_options; changed = true; }
 
-  // Preserve native/client toolsets. Declare fallback tools only when absent.
+  // Preserve native/client toolsets, but fill in any missing core OpenCode
+  // agent tools. Clients such as Pi send their own partial tool surface; keeping
+  // that surface while appending only the missing core names preserves client
+  // functionality and keeps the anonymous Zen request recognisably agent-shaped.
   const declared: string[] = Array.isArray(parsed.tools)
     ? parsed.tools.map((t: any) => String(t?.function?.name || t?.name || '')).filter(Boolean)
     : [];
-  const missing = declared.length ? [] : FREE_TIER_CORE_TOOLS;
+  const missing = FREE_TIER_CORE_TOOLS.filter(name => !declared.includes(name));
   if (missing.length) {
     const tools = freeTierStubToolset(missing).map(t => endpoint === 'responses'
       ? { type: 'function', ...t.function } : t);
