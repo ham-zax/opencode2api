@@ -324,6 +324,9 @@ function saveCustomProxies() {
 
 const UPSTREAM = 'https://opencode.ai/zen';
 const PORT = parseInt(process.env.PORT || '13339');
+const HOST = process.env.HOST || '0.0.0.0';
+const RUNTIME_GENERATION = process.env.RUNTIME_GENERATION || 'standalone';
+let runtimeDraining = false;
 const MAX_RETRIES = 3;
 const TIMEOUT = 15000;
 const STREAM_FIRST_BYTE_TIMEOUT_MS = parseInt(process.env.STREAM_FIRST_BYTE_TIMEOUT_MS || '30000');
@@ -781,6 +784,7 @@ function rememberRetryAfter(addr: string, headers: Record<string, string> | unde
 let proxyHealthSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 function saveProxyHealthState(): void {
+  if (runtimeDraining) return;
   const now = Date.now();
   const validated = [...validatedExits.entries()]
     .filter(([, at]) => now - at <= VALIDATED_TTL_MS)
@@ -795,7 +799,7 @@ function saveProxyHealthState(): void {
     }
   }
   try {
-    const tmp = `${PROXY_HEALTH_FILE}.tmp`;
+    const tmp = `${PROXY_HEALTH_FILE}.${process.pid}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify({ version: 1, upstream: UPSTREAM, savedAt: now, validated, cooldowns, modelBans }), 'utf-8');
     fs.renameSync(tmp, PROXY_HEALTH_FILE);
   } catch (e: any) {
@@ -804,7 +808,7 @@ function saveProxyHealthState(): void {
 }
 
 function scheduleProxyHealthSave(): void {
-  if (proxyHealthSaveTimer) return;
+  if (runtimeDraining || proxyHealthSaveTimer) return;
   proxyHealthSaveTimer = setTimeout(() => {
     proxyHealthSaveTimer = null;
     saveProxyHealthState();
@@ -916,8 +920,11 @@ function loadKeys() {
 }
 
 function saveKeys() {
+  if (runtimeDraining) return;
   try {
-    fs.writeFileSync(KEYS_FILE, JSON.stringify(apiKeys, null, 2), 'utf-8');
+    const tmp = `${KEYS_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(apiKeys, null, 2), 'utf-8');
+    fs.renameSync(tmp, KEYS_FILE);
   } catch (e: any) {
     console.error(`[Keys] Save failed: ${e.message}`);
   }
@@ -3318,7 +3325,8 @@ async function fetchModelsFromUpstream(): Promise<ZenModel[]> {
       applyModelCatalog(upstream, metadata, Date.now());
       catalogLastError = '';
       try {
-        const tmp = `${MODEL_CATALOG_FILE}.tmp`;
+        if (runtimeDraining) return cachedModels;
+        const tmp = `${MODEL_CATALOG_FILE}.${process.pid}.tmp`;
         fs.writeFileSync(tmp, JSON.stringify({ version: 1, upstream: UPSTREAM, checkedAt: cachedModelsTime, models: upstream, metadata }));
         fs.renameSync(tmp, MODEL_CATALOG_FILE);
       } catch (e: any) { console.warn(`[Models] Could not persist catalog: ${e?.message || e}`); }
@@ -3677,6 +3685,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
     sendJson(nodeRes, 200, {
       ok: true,
       uptime,
+      runtime: { generation: RUNTIME_GENERATION, pid: process.pid, draining: runtimeDraining },
       stats,
       activeKeys: keySlotPools.size,
       maxActiveKeys: MAX_ACTIVE_KEYS,
@@ -4664,8 +4673,13 @@ async function main() {
   setInterval(verifyFreeModels, MODEL_VERIFY_INTERVAL_MS);
 
   // Start HTTP server
-  server.listen(PORT, () => {
-    console.log(`[Startup] Listening on port ${PORT}`);
+  process.on('SIGUSR1', () => {
+    runtimeDraining = true;
+    console.log('[Runtime] Drain mode enabled; shared state persistence paused');
+  });
+
+  server.listen(PORT, HOST, () => {
+    console.log(`[Startup] Listening on ${HOST}:${PORT} generation=${RUNTIME_GENERATION}`);
     console.log(`[Startup] Candidate proxies: ${candidates.length} items`);
     console.log(`[Startup] Fallback proxies: ${customSlots.length} items`);
     console.log(`[Startup] WARP: ${warpStatus}`);

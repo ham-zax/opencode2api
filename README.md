@@ -40,6 +40,8 @@ Direct access to free AI tiers on OpenCode Zen often results in strict single-IP
 - 🤖 **Automated Daily Anycast IP Refresh**: Built-in GitHub Actions workflow and local benchmark script to rank top 500 low-latency edge IPs daily.
 - 📊 **Built-In Web Dashboard**: Live traffic analytics, key management, candidate pool health tester, real-time logs, and chat playground.
 - 📦 **Zero-Config Deployment**: Optimized Bun and Docker Compose setup.
+- ♻️ **Zero-Downtime Runtime Reloads**: A stable front supervisor validates a replacement worker, atomically routes new requests to it, and lets existing streams drain on the old worker before shutdown.
+- 🔒 **Compatibility Tool Lock**: The gateway may add OpenCode-required compatibility tool stubs upstream, but only tool names explicitly authorized by the caller are allowed back through the response boundary.
 
 ---
 
@@ -94,7 +96,7 @@ cd opencode2api
 bun install
 
 # Start gateway (Press Ctrl + C anytime to stop)
-bun run gate-docker.ts
+bun run supervisor.ts
 ```
 
 ---
@@ -103,13 +105,13 @@ bun run gate-docker.ts
 
 ```bash
 # Start in background
-nohup bun run gate-docker.ts > opencode2api.log 2>&1 &
+nohup bun run supervisor.ts > opencode2api.log 2>&1 &
 
 # View live logs anytime
 tail -f opencode2api.log
 
 # Stop the background process
-pkill -f "gate-docker.ts"
+pkill -f "supervisor.ts"
 ```
 
 ---
@@ -128,6 +130,25 @@ docker compose down
 ```
 
 Gateway will be live at `http://localhost:13339` with Web Dashboard accessible at `http://localhost:13339/`.
+
+### Zero-downtime systemd deployment
+
+The production unit in `ops/systemd/opencode2api.service` keeps the public listener on port `13339` and runs gateway workers on loopback ports `13439` and `13440`. To install or update the unit:
+
+```bash
+sudo cp ops/systemd/opencode2api.service /etc/systemd/system/opencode2api.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now opencode2api.service
+```
+
+After code or configuration changes, validate them first, then hot-reload without cutting existing streams:
+
+```bash
+bun test
+./scripts/reload-runtime.sh
+```
+
+`SIGHUP` starts a replacement worker, waits for its `/api/status` health check and runtime-generation marker, switches new requests atomically, then drains the previous worker. Inspect the routing layer at `GET /__supervisor/status`.
 
 ---
 

@@ -1,0 +1,22 @@
+[Unit]
+Description=OpenCode2API zero-downtime supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/repo/opencode2api
+EnvironmentFile=-/etc/opencode2api.env
+Environment=PORT=13339
+Environment=HOST=127.0.0.1
+Environment=WORKER_PORTS=13439,13440
+ExecStart=/home/ubuntu/.bun/bin/bun run supervisor.ts
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
