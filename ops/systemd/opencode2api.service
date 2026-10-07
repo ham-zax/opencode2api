@@ -6,10 +6,11 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=ubuntu
+Group=ubuntu
 WorkingDirectory=/home/ubuntu/repo/opencode2api
 EnvironmentFile=-/etc/opencode2api.env
 Environment=PORT=13339
-Environment=HOST=127.0.0.1
+Environment=HOST=0.0.0.0
 Environment=WORKER_PORTS=13439,13440
 ExecStart=/home/ubuntu/.bun/bin/bun run supervisor.ts
 ExecReload=/bin/kill -HUP $MAINPID
@@ -17,6 +18,8 @@ Restart=always
 RestartSec=2
 KillSignal=SIGTERM
 TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
