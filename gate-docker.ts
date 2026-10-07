@@ -479,11 +479,15 @@ function shapeAgentRequest(
   const declared: string[] = callerHasTools
     ? parsed.tools.map((t: any) => String(t?.function?.name || t?.name || '')).filter(Boolean)
     : [];
-  const missing = callerHasTools ? FREE_TIER_CORE_TOOLS.filter(name => !declared.includes(name)) : [];
+  if (!callerHasTools && (parsed.tool_choice == null || parsed.tool_choice === 'auto')) {
+    parsed.tool_choice = 'none';
+    changed = true;
+  }
+  const missing = FREE_TIER_CORE_TOOLS.filter(name => !declared.includes(name));
   if (missing.length) {
     const tools = freeTierStubToolset(missing).map(t => endpoint === 'responses'
       ? { type: 'function', ...t.function } : t);
-    parsed.tools = [...parsed.tools, ...tools];
+    parsed.tools = Array.isArray(parsed.tools) ? [...parsed.tools, ...tools] : tools;
     changed = true;
   }
 

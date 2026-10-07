@@ -587,7 +587,8 @@ describe('HTTP compatibility', () => {
         const doc = JSON.parse(body);
         expect(doc.model).toBe('muse-spark-9-contributor-free');
         expect(doc.input[0].content).toBe('Hi');
-        expect(doc.tools).toBeUndefined();
+        expect(doc.tools).toHaveLength(5);
+        expect(doc.tool_choice).toBe('none');
         return { status: 200, stream: responsesStream() };
       });
       const response = await fetch(base + '/v1/chat/completions', { method: 'POST', headers,
@@ -841,16 +842,19 @@ describe('Zen discovery and health', () => {
     expect((await pending).status).toBe(0);
   });
 
-  test('tool-free callers stay tool-free while still receiving free-tier stream shaping', () => {
+  test('tool-free callers keep upstream agent stubs but cannot execute them', () => {
     const g = fixture();
-    const chat = g.shapeAgentRequest(JSON.stringify({ model: 'space-bunny-free', messages: [{ role: 'user', content: 'write a long text' }] }), 'chat');
-    const shaped = JSON.parse(chat.body);
-    expect(shaped.stream).toBe(true);
-    expect(shaped.tools).toBeUndefined();
-
-    const responses = JSON.parse(g.chatBodyToResponses(JSON.stringify({ model: 'muse-spark-1.3-contributor-free', messages: [{ role: 'user', content: 'hello' }] }))!);
-    expect(responses.stream).toBe(true);
-    expect(responses.tools).toBeUndefined();
+    for (const endpoint of ['chat', 'responses'] as const) {
+      const shaped = g.shapeAgentRequest(JSON.stringify({
+        model: endpoint === 'chat' ? 'space-bunny-free' : 'muse-spark-1.3-contributor-free',
+        ...(endpoint === 'chat' ? { messages: [{ role: 'user', content: 'write a long text' }] } : { input: 'write a long text' }),
+        stream: false,
+      }), endpoint);
+      const body = JSON.parse(shaped.body);
+      expect(body.stream).toBe(true);
+      expect(body.tools.length).toBe(5);
+      expect(body.tool_choice).toBe('none');
+    }
   });
 
   test('agent shaping preserves client tools and appends missing core tools', () => {
