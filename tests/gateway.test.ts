@@ -27,6 +27,10 @@ function fixture(probeTimeout = 2500) {
   let reply: any = { ip: '203.0.113.1', country: 'US' };
   let latency = 1700;
   let hang = false;
+  let streamChunks: string[] | null = null;
+  let streamOpen = false;
+  let destroyedRequests = 0;
+  const queuedStreams: string[][] = [];
   let handler: any;
   const timers: { callback: () => void; delay: number; timer: ReturnType<typeof setTimeout> }[] = [];
   class Clock extends Date { static now() { return now; } }
@@ -53,7 +57,8 @@ function fixture(probeTimeout = 2500) {
       request(_url: any, _options: any, callback: any) {
         requests++;
         const req = new EventEmitter() as any;
-        req.destroy = () => {};
+        req.destroy = () => { destroyedRequests++; };
+        req.setTimeout = () => {};
         req.write = () => true;
         req.end = () => queueMicrotask(() => {
           if (hang) return;
@@ -61,9 +66,12 @@ function fixture(probeTimeout = 2500) {
           const res = new EventEmitter() as any;
           res.statusCode = replyStatus;
           res.headers = {};
+          res.destroy = () => {};
           callback(res);
-          res.emit('data', Buffer.from(JSON.stringify(reply)));
-          res.emit('end');
+          const chunks = queuedStreams.shift() || streamChunks;
+          if (chunks) for (const chunk of chunks) res.emit('data', Buffer.from(chunk));
+          else res.emit('data', Buffer.from(JSON.stringify(reply)));
+          if (!streamOpen) res.emit('end');
         });
         return req;
       },
@@ -71,8 +79,9 @@ function fixture(probeTimeout = 2500) {
   });
   const gateway: any = vm.runInContext(definitions + `
     ({ coarseScreen, probe, backgroundProbeSweep, allocateKeySlots, loadCandidates,
-       replaceFailedSlot, getKeySlotPool, releaseKeySlots, pruneGloballyUnusableSlots, topUpKeySlotPool,
-       freeExitCount, currentDemandKeyCount, operationalPoolTarget, currentPoolState, poolGenerationConcurrencyCap, waitForPoolGenerationCapacity, markValidated, noteExitFailure,
+       replaceFailedSlot, getKeySlotPool, releaseKeySlots, pruneGloballyUnusableSlots, topUpKeySlotPool, desiredProxySlots,
+       choosePoolSlot, exitActiveRequests, sessionExits, dispatch, doHttpsStream, initialSseEvent, readBody,
+       freeExitCount, currentDemandKeyCount, operationalPoolTarget, currentPoolState, markValidated, noteExitFailure, noteExitSuccess,
        isExitUsable, validatedExits, exitHealth, exitModelBans, keySlotPools, coarseSeen,
        saveProxyHealthState, loadProxyHealthState,
        setCandidates(value) { candidates = value; },
@@ -98,9 +107,12 @@ function fixture(probeTimeout = 2500) {
   return {
     ...gateway,
     get requests() { return requests; },
+    get destroyedRequests() { return destroyedRequests; },
     get now() { return now; },
     advance(ms: number) { now += ms; },
-    echo(value: any, ms = 1700, status = 200) { reply = value; latency = ms; replyStatus = status; },
+    echo(value: any, ms = 1700, status = 200) { reply = value; latency = ms; replyStatus = status; streamChunks = null; streamOpen = false; },
+    echoStream(chunks: string[], open = false) { streamChunks = chunks; streamOpen = open; latency = 0; replyStatus = 200; },
+    queueStreams(chunks: string[][]) { queuedStreams.push(...chunks); latency = 0; replyStatus = 200; },
     cache(doc: any) { stateFiles.set(path.resolve(import.meta.dir, '../models_cache.json'), JSON.stringify(doc)); },
     get cachedDoc() { const value = stateFiles.get(path.resolve(import.meta.dir, '../models_cache.json')); return value ? JSON.parse(value) : undefined; },
     get healthDoc() { const value = stateFiles.get(path.resolve(import.meta.dir, '../proxy_health_cache.json')); return value ? JSON.parse(value) : undefined; },
@@ -162,12 +174,19 @@ describe('proxy pool regression checks', () => {
     expect(g.exitHealth.get(item.address)?.cooldownUntil).toBeGreaterThan(g.now);
   });
 
-  test('generation concurrency cap tightens as pool capacity falls', () => {
+  test('a concurrent successful stream cannot erase a newer cooldown or model ban', () => {
     const g = fixture();
-    expect(g.poolGenerationConcurrencyCap('degraded')).toBe(1);
-    expect(g.poolGenerationConcurrencyCap('constrained')).toBe(2);
-    expect(g.poolGenerationConcurrencyCap('watch')).toBeGreaterThanOrEqual(2);
-    expect(Number.isFinite(g.poolGenerationConcurrencyCap('healthy'))).toBe(false);
+    const addr = candidate(1).address;
+    g.noteExitFailure(addr, 429, 'big-pickle');
+    const deadline = g.exitHealth.get(addr).cooldownUntil;
+    g.exitModelBans.set(addr, new Map([['big-pickle', { fails: 3, bannedUntil: g.now + 1000 }]]));
+    g.noteExitSuccess(addr, 'big-pickle');
+    expect(g.exitHealth.get(addr).cooldownUntil).toBe(deadline);
+    expect(g.exitModelBans.get(addr).has('big-pickle')).toBe(true);
+    g.advance(deadline - g.now + 1);
+    g.noteExitSuccess(addr, 'big-pickle');
+    expect(g.exitHealth.get(addr).cooldownUntil).toBe(0);
+    expect(g.exitModelBans.get(addr).has('big-pickle')).toBe(false);
   });
 
   test('cached screen measurements obey the current admission ceiling', async () => {
@@ -236,7 +255,7 @@ describe('proxy pool regression checks', () => {
     const g = fixture();
     const pool = { keyId: 'key', slots: [], rrCursor: 0, lastUsedAt: g.now };
     const body = JSON.stringify({ model: 'muse-spark-1.3-contributor-free', input: 'Hi', stream: true });
-    g.echo({ type: 'response.output_text.delta', delta: 'partial' }, 100, 200);
+    g.echoStream(['data: {"type":"response.output_text.delta","delta":"partial"}\n\n']);
     const result = await g.dispatchDirect('/v1/responses', 'POST', { 'content-type': 'application/json' }, body, pool);
     expect(result.status).toBe(200);
     await expect(new Response(result.stream).text()).rejects.toThrow('terminal event');
@@ -500,6 +519,8 @@ describe('HTTP compatibility', () => {
       expect(doc.timeouts.proxyConnectMs).toBe(15000);
       expect(doc.directEgress.usable).toBe(true);
       expect(doc.directEgress.retryAfterSeconds).toBe(0);
+      expect(doc.pool.backpressureWaitMs).toBe(0);
+      expect(doc.pool.generationConcurrencyLimit).toBeNull();
     });
   });
 
@@ -544,35 +565,39 @@ describe('HTTP compatibility', () => {
     });
   });
 
-  test('degraded pool queues a brief concurrent burst instead of rejecting it', async () => {
+  test.each([[15, false], [15, true], [25, false], [25, true]])('degraded pool admits %s simultaneous generations (stream=%s) without waiting for earlier ones', async (count, stream) => {
     await withServer(async (base, g) => {
       let calls = 0;
+      let allStarted!: () => void;
+      const started = new Promise<void>(resolve => { allStarted = resolve; });
+      let release!: () => void;
+      const gate = new Promise<void>(resolve => { release = resolve; });
       g.setDispatch(async () => {
         calls++;
-        if (calls === 1) await new Promise(resolve => setTimeout(resolve, 25));
+        if (calls === count) allStarted();
+        await gate;
         return { status: 200, stream: replyStream() };
       });
-      const first = fetch(base + '/v1/chat/completions', { method: 'POST', headers, body: completion(false) });
-      await new Promise(resolve => setTimeout(resolve, 5));
-      const second = fetch(base + '/v1/chat/completions', { method: 'POST', headers, body: completion(false) });
-      const [a, b] = await Promise.all([first, second]);
-      expect(a.status).toBe(200);
-      expect(b.status).toBe(200);
-      expect(calls).toBe(2);
+      const requests = Array.from({ length: count }, () => fetch(base + '/v1/chat/completions', {
+        method: 'POST', headers, body: completion(stream),
+      }));
+      const deadline = setTimeout(release, 1000);
+      try {
+        await Promise.race([started, gate]);
+        expect(calls).toBe(count);
+        expect(g.activeRequests['test-key']).toBe(count);
+      } finally {
+        clearTimeout(deadline);
+        release();
+        const replies = await Promise.all(requests);
+        for (const response of replies) {
+          expect(response.status).toBe(200);
+          if (stream) expect(await response.text()).toContain('data: [DONE]');
+          else expect((await response.json()).choices[0].message.content).toBe('OK');
+        }
+      }
+      expect(g.activeRequests['test-key']).toBe(0);
     });
-  });
-
-  test('degraded pool eventually returns retry guidance when saturation persists', async () => {
-    const g = fixture();
-    g.activeRequests['test-key'] = 1;
-    const pending = g.waitForPoolGenerationCapacity('test-key', 5);
-    g.advance(5);
-    g.fireTimers(5);
-    const result = await pending;
-    expect(result.ok).toBe(false);
-    expect(result.state).toBe('degraded');
-    expect(result.cap).toBe(1);
-    expect(result.waitedMs).toBeGreaterThanOrEqual(5);
   });
 
   test('non-stream clients receive assembled JSON and usage is counted once', async () => {
@@ -586,6 +611,38 @@ describe('HTTP compatibility', () => {
       expect(doc.usage.total_tokens).toBe(3);
       expect(g.getKeys()['test-key'].totalRequests).toBe(1);
       expect(g.getKeys()['test-key'].totalTokens).toBe(3);
+      expect(g.activeRequests['test-key']).toBe(0);
+    });
+  });
+
+  test.each([false, true])('client disconnect cancels an open generation (stream=%s) and releases the key', async (stream) => {
+    await withServer(async (base, g) => {
+      let cancelled = false;
+      let markStarted!: () => void;
+      const started = new Promise<void>(resolve => { markStarted = resolve; });
+      g.setDispatch(async () => {
+        markStarted();
+        return { status: 200, stream: new ReadableStream({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n'));
+          },
+          cancel() { cancelled = true; },
+        }) };
+      });
+      const control = new AbortController();
+      const pending = fetch(base + '/v1/chat/completions', { method: 'POST', headers, body: completion(stream), signal: control.signal });
+      await started;
+      if (stream) {
+        const response = await pending;
+        await response.body!.cancel();
+      } else {
+        control.abort();
+        await expect(pending).rejects.toThrow();
+      }
+      for (let i = 0; i < 100 && (!cancelled || g.activeRequests['test-key']); i++) {
+        await new Promise(resolve => setTimeout(resolve, 5));
+      }
+      expect(cancelled).toBe(true);
       expect(g.activeRequests['test-key']).toBe(0);
     });
   });
@@ -1030,5 +1087,217 @@ describe('Zen discovery and health', () => {
     expect(headers['user-agent']).toBe('opencode/latest/3.0.0/cli');
     for (const name of ['x-opencode-session', 'x-opencode-session-id', 'x-session-affinity', 'x-session-id']) expect(headers[name]).toBe(session);
     expect(headers.authorization).toBe('Bearer public');
+  });
+});
+
+describe('stream admission and exit routing', () => {
+  const body = JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'Hi' }], stream: true });
+  const first = 'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":null}]}\n\n';
+  const final = 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
+  function pool(...addresses: string[]) {
+    return { keyId: 'key', slots: addresses.map(addr => ({ addr, url: `http://${addr}`, proto: 'http' })), rrCursor: 0, lastUsedAt: 0 };
+  }
+
+  test('disconnect during an unfinished body settles the read and releases its listeners', async () => {
+    const g = fixture();
+    for (const alreadyAborted of [false, true]) {
+      const req = new EventEmitter();
+      const control = new AbortController();
+      if (alreadyAborted) control.abort();
+      const reading = g.readBody(req, control.signal);
+      if (!alreadyAborted) { req.emit('data', Buffer.from('{')); control.abort(); }
+      await expect(reading).rejects.toThrow('Client disconnected during request body');
+      expect(req.eventNames()).toHaveLength(0);
+    }
+  });
+
+  test('split SSE frames and heartbeats preserve bytes until productive output', async () => {
+    const g = fixture();
+    const chunks = [': keepalive\n\n', 'data: {"choices":[{"delta":{"role":"assistant"}}]}\n\n', first.slice(0, 20), first.slice(20), final];
+    g.echoStream(chunks);
+    const result = await g.doHttpsStream('/v1/chat/completions', 'POST', {}, body);
+    expect(await new Response(result.stream).text()).toBe(chunks.join(''));
+    expect(g.destroyedRequests).toBe(0);
+  });
+
+  test('heartbeat-only EOF is retryable before stream handoff', async () => {
+    const g = fixture();
+    g.echoStream([': keepalive\n\n']);
+    await expect(g.doHttpsStream('/v1/chat/completions', 'POST', {}, body)).rejects.toThrow('before a productive event');
+    expect(g.destroyedRequests).toBe(1);
+  });
+
+  test('heartbeats cannot extend the initial productive-event deadline', async () => {
+    const g = fixture();
+    g.echoStream([': keepalive\n\n'], true);
+    const pending = g.doHttpsStream('/v1/chat/completions', 'POST', {}, body);
+    await new Promise(resolve => queueMicrotask(resolve));
+    g.fireTimers(30000);
+    await expect(pending).rejects.toThrow('first SSE event timeout');
+    expect(g.destroyedRequests).toBe(1);
+  });
+
+  test('initial prelude size is bounded before handoff', async () => {
+    const g = fixture();
+    g.echoStream([':' + 'x'.repeat(1024 * 1024)]);
+    await expect(g.doHttpsStream('/v1/chat/completions', 'POST', {}, body)).rejects.toThrow('prelude exceeds');
+  });
+
+  test('early 200 error events rotate exits and apply a rate-limit cooldown', async () => {
+    const g = fixture();
+    g.queueStreams([['data: {"error":{"message":"Rate limit exceeded","type":"rate_limit"}}\n\n'], [first, final]]);
+    const p = pool('203.0.113.1:8080', '203.0.113.2:8080');
+    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p);
+    expect(await new Response(result.stream).text()).toBe(first + final);
+    expect(g.requests).toBe(2);
+    expect(g.isExitUsable(p.slots[0].addr, 'big-pickle')).toBe(false);
+    expect(g.exitActiveRequests.size).toBe(0);
+  });
+
+  test('Responses metadata alone does not commit an empty stream', async () => {
+    const g = fixture();
+    g.echoStream(['data: {"type":"response.created","response":{"id":"resp-test"}}\n\n']);
+    await expect(g.doHttpsStream('/v1/responses', 'POST', {}, body)).rejects.toThrow('before a productive event');
+    expect(g.initialSseEvent('data: {"type":"response.function_call_arguments.delta","delta":"{"}', true)).toBe(true);
+  });
+
+  test('client abort before first output cancels work without penalizing the exit', async () => {
+    const g = fixture();
+    g.hang();
+    const control = new AbortController();
+    const p = pool('203.0.113.1:8080');
+    const pending = g.dispatch('/v1/chat/completions', 'POST', {}, body, p, 0, new Set(), control.signal);
+    control.abort(new Error('cancelled by caller'));
+    await expect(pending).rejects.toThrow('cancelled by caller');
+    expect(g.exitHealth.size).toBe(0);
+    expect(g.exitActiveRequests.size).toBe(0);
+    expect(g.requests).toBe(1);
+    expect(g.destroyedRequests).toBe(1);
+  });
+
+  test('abort after first output releases the exit and does not replay the request', async () => {
+    const g = fixture();
+    g.echoStream([first], true);
+    const control = new AbortController();
+    const p = pool('203.0.113.1:8080');
+    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p, 0, new Set(), control.signal);
+    expect(g.exitActiveRequests.get(p.slots[0].addr)).toBe(1);
+    control.abort(new Error('cancelled by caller'));
+    await expect(new Response(result.stream).text()).rejects.toThrow('cancelled by caller');
+    expect(g.exitHealth.size).toBe(0);
+    expect(g.exitActiveRequests.size).toBe(0);
+    expect(g.requests).toBe(1);
+  });
+
+  test('session affinity survives sequential turns but gives parallel traffic a free exit', () => {
+    const g = fixture();
+    const p = pool('203.0.113.1:8080', '203.0.113.2:8080', '203.0.113.3:8080');
+    const chosen = g.choosePoolSlot(p, 'big-pickle', 'session-a', new Set());
+    expect(g.choosePoolSlot(p, 'big-pickle', 'session-a', new Set()).addr).toBe(chosen.addr);
+    g.exitActiveRequests.set(chosen.addr, 1);
+    const next = g.choosePoolSlot(p, 'big-pickle', 'session-a', new Set());
+    expect(next.addr).not.toBe(chosen.addr);
+    g.noteExitFailure(next.addr, 429);
+    expect(g.choosePoolSlot(p, 'big-pickle', 'session-a', new Set()).addr).not.toBe(next.addr);
+  });
+
+  test('exit occupancy remains reserved until stream cancellation', async () => {
+    const g = fixture();
+    g.echoStream([first], true);
+    const p = pool('203.0.113.1:8080');
+    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p);
+    expect(g.exitActiveRequests.get(p.slots[0].addr)).toBe(1);
+    await result.stream.cancel();
+    expect(g.exitActiveRequests.size).toBe(0);
+    expect(g.exitHealth.size).toBe(0);
+  });
+
+  test('a truncated handed-off stream records a strike, releases occupancy, and never replays', async () => {
+    const g = fixture();
+    g.echoStream([first]);
+    const p = pool('203.0.113.1:8080');
+    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p);
+    await expect(new Response(result.stream).text()).rejects.toThrow();
+    expect(g.exitHealth.get(p.slots[0].addr)?.fails).toBe(1);
+    expect(g.exitActiveRequests.size).toBe(0);
+    expect(g.requests).toBe(1);
+  });
+
+  test('validated spare exits are probed once per top-up rather than once per winner', async () => {
+    const g = fixture();
+    const items = Array.from({ length: 6 }, (_, i) => candidate(i + 1, i === 0 ? 'key' : null));
+    const p = pool(items[0].address);
+    g.setCandidates(items);
+    g.keySlotPools.set('key', p);
+    for (const c of items) g.markValidated(c.address);
+    const calls = new Map<string, number>();
+    g.setProbe(async (c: any) => { calls.set(c.address, (calls.get(c.address) || 0) + 1); return { ok: true, latencyMs: 100 }; });
+    expect(await g.topUpKeySlotPool(p)).toBe(2);
+    expect(Math.max(...calls.values())).toBe(1);
+    expect(p.slots).toHaveLength(3);
+  });
+
+  test('a replaced pool starts its own top-up while stale work cannot clear its mutex', async () => {
+    const g = fixture();
+    const items = Array.from({ length: 6 }, (_, i) => candidate(i + 1, i === 0 ? 'key' : null));
+    g.setCandidates(items);
+    for (const c of items) g.markValidated(c.address);
+    let releaseOld!: () => void;
+    let releaseNew!: () => void;
+    const oldGate = new Promise<void>(resolve => { releaseOld = resolve; });
+    const newGate = new Promise<void>(resolve => { releaseNew = resolve; });
+    let phase = 0;
+    let probes = 0;
+    g.setProbe(async () => { probes++; await (phase === 0 ? oldGate : newGate); return { ok: true, latencyMs: 100 }; });
+    const oldPool = pool(items[0].address);
+    g.keySlotPools.set('key', oldPool);
+    const staleWork = g.topUpKeySlotPool(oldPool);
+    phase = 1;
+    const livePool = pool(items[0].address);
+    g.keySlotPools.set('key', livePool);
+    const liveWork = g.topUpKeySlotPool(livePool);
+    releaseOld();
+    expect(await staleWork).toBe(0);
+    const sharedWork = g.topUpKeySlotPool(livePool);
+    expect(probes).toBe(10);
+    releaseNew();
+    expect(await liveWork).toBe(2);
+    expect(await sharedWork).toBe(2);
+    expect(oldPool.slots).toHaveLength(1);
+    expect(livePool.slots).toHaveLength(3);
+  });
+
+  test('parallel demand grows validated routing capacity without capping requests', async () => {
+    const g = fixture();
+    const items = Array.from({ length: 18 }, (_, i) => candidate(i + 1, i < 3 ? 'key' : null));
+    const p = pool(...items.slice(0, 3).map(c => c.address));
+    g.setCandidates(items);
+    g.keySlotPools.set('key', p);
+    for (const c of items) g.markValidated(c.address);
+    g.activeRequests.key = 25;
+    g.setProbe(async () => ({ ok: true, latencyMs: 100 }));
+    const [a, b] = await Promise.all([g.getKeySlotPool('key'), g.getKeySlotPool('key')]);
+    expect(a).toBe(b);
+    expect(p.slots).toHaveLength(16);
+    expect(g.activeRequests.key).toBe(25);
+    expect(new Set(p.slots.map((s: any) => s.addr)).size).toBe(16);
+  });
+
+  test('a fresh pool grows when parallel demand arrives during its initial allocation', async () => {
+    const g = fixture();
+    const items = Array.from({ length: 18 }, (_, i) => candidate(i + 1));
+    g.setCandidates(items);
+    for (const c of items) g.markValidated(c.address);
+    g.setScreen(healthy);
+    g.setProbe(async () => ({ ok: true, latencyMs: 100 }));
+    g.activeRequests.key = 1;
+    const firstAllocation = g.getKeySlotPool('key');
+    g.activeRequests.key = 25;
+    const burst = Array.from({ length: 24 }, () => g.getKeySlotPool('key'));
+    const pools = await Promise.all([firstAllocation, ...burst]);
+    expect(pools.every(p => p === pools[0])).toBe(true);
+    expect(pools[0].slots).toHaveLength(16);
+    expect(new Set(pools[0].slots.map((s: any) => s.addr)).size).toBe(16);
+    expect(g.activeRequests.key).toBe(25);
   });
 });

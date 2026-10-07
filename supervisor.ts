@@ -135,29 +135,57 @@ export class RuntimeSupervisor {
 
     runtime.inFlight++;
     let finished = false;
+    let cancelled = false;
+    let upstreamRes: http.IncomingMessage | null = null;
     const finish = () => {
       if (finished) return;
       finished = true;
       runtime.inFlight = Math.max(0, runtime.inFlight - 1);
     };
+    // Per-request cancellation only: destroys this proxy's upstream
+    // request/response pair. Never touches runtime.agent, so unrelated
+    // keep-alive sockets stay usable.
+    let upstream!: http.ClientRequest;
+    const cancelUpstream = () => {
+      if (cancelled) return;
+      cancelled = true;
+      try { upstreamRes?.destroy(); } catch {}
+      try { upstream.destroy(); } catch {}
+    };
 
-    const upstream = http.request({
+    upstream = http.request({
       host: '127.0.0.1',
       port: runtime.port,
       method: req.method,
       path: req.url,
       headers: { ...req.headers, host: `127.0.0.1:${runtime.port}` },
       agent: runtime.agent,
-    }, upstreamRes => {
-      const headers = { ...upstreamRes.headers };
-      res.writeHead(upstreamRes.statusCode || 502, headers);
-      upstreamRes.pipe(res);
-      upstreamRes.once('end', finish);
-      upstreamRes.once('close', finish);
+    }, incoming => {
+      upstreamRes = incoming;
+      if (cancelled || res.destroyed) {
+        // Client went away before headers completed (or during the race
+        // to pipe). Release the worker connection; finish fires on the
+        // resulting 'close' below so drain occupancy is held until the
+        // worker connection has actually been cancelled.
+        try { incoming.destroy(); } catch {}
+      } else {
+        const headers = { ...incoming.headers };
+        res.writeHead(incoming.statusCode || 502, headers);
+        incoming.pipe(res);
+      }
+      incoming.once('end', finish);
+      incoming.once('close', finish);
+      incoming.once('error', incomingError => {
+        finish();
+        if (!cancelled && !res.destroyed && res.headersSent) {
+          try { res.destroy(incomingError as Error); } catch {}
+        }
+      });
     });
 
     upstream.once('error', error => {
       finish();
+      if (cancelled || res.destroyed) return;
       if (!res.headersSent) {
         res.writeHead(502, { 'content-type': 'application/json', 'retry-after': '1' });
         res.end(JSON.stringify({ type: 'runtime_proxy_error', message: error.message }));
@@ -165,12 +193,28 @@ export class RuntimeSupervisor {
         res.destroy(error);
       }
     });
+    // No response received yet: 'close' means the worker connection for
+    // this request was released (including via cancelUpstream). When a
+    // response exists, its own 'close' drives finish so occupancy is not
+    // dropped while the body is still streaming.
+    upstream.once('close', () => {
+      if (!upstreamRes) finish();
+    });
 
     req.once('aborted', () => {
-      try { upstream.destroy(); } catch {}
-      finish();
+      if (finished) return;
+      cancelUpstream();
     });
-    res.once('close', finish);
+    // Authoritative client-disconnect signal for both pre-header aborts
+    // and mid-SSE disconnects. Cancels the worker connection but does not
+    // drop occupancy here: finish waits for the upstream 'close' so drain
+    // accounting cannot reach zero before cancellation propagates. Guarded
+    // by finished/writableEnded so normally completed responses are left
+    // alone and their keep-alive socket stays reusable.
+    res.once('close', () => {
+      if (finished) return;
+      if (!res.writableEnded) cancelUpstream();
+    });
     req.pipe(upstream);
   };
 }

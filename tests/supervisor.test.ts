@@ -116,4 +116,160 @@ describe('runtime supervisor', () => {
     expect(supervisor.active).toBe(first);
     await first.stop();
   });
+
+  test('client disconnect before response headers cancels the worker request', async () => {
+    const workerPort = await freePort();
+    const ports = [workerPort, await freePort()];
+    let workerHits = 0;
+    let workerSawClose = false;
+    const worker = http.createServer((_req, res) => {
+      workerHits++;
+      res.once('close', () => { workerSawClose = true; });
+      // Never respond: the client goes away while waiting for headers.
+    });
+    await listen(worker, workerPort);
+    const factory = async (port: number, generation: string): Promise<ManagedRuntime> => ({
+      generation,
+      port,
+      inFlight: 0,
+      draining: false,
+      agent: new http.Agent({ keepAlive: true }),
+      markDraining() {},
+      async stop() {},
+    });
+    const supervisor = new RuntimeSupervisor({ workerPorts: ports, factory });
+    const runtime = await supervisor.start();
+    const front = http.createServer(supervisor.handle);
+    const frontPort = await listen(front);
+
+    try {
+      await new Promise<void>(resolve => {
+        const client = http.get(`http://127.0.0.1:${frontPort}/hang`, () => {});
+        client.once('error', () => {});
+        setTimeout(() => { client.destroy(); resolve(); }, 50);
+      });
+      // Cancellation must reach the worker; occupancy must settle only
+      // after the worker connection is released (not on res 'close').
+      await waitFor(() => workerSawClose, 2000);
+      await waitFor(() => runtime.inFlight === 0, 2000);
+      expect(workerHits).toBe(1);
+      expect(workerSawClose).toBe(true);
+      expect(runtime.inFlight).toBe(0);
+    } finally {
+      runtime.agent.destroy();
+      await new Promise<void>(resolve => front.close(() => resolve()));
+      await new Promise<void>(resolve => worker.close(() => resolve()));
+    }
+  });
+
+  test('client disconnect during SSE cancels the worker stream and leaves the runtime reusable', async () => {
+    const workerPort = await freePort();
+    const ports = [workerPort, await freePort()];
+    let sseCloses = 0;
+    const worker = http.createServer((req, res) => {
+      if (req.url === '/sse') {
+        res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+        res.write('data: {"content":"first"}\n\n');
+        res.once('close', () => { sseCloses++; });
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('ok');
+    });
+    await listen(worker, workerPort);
+    const factory = async (port: number, generation: string): Promise<ManagedRuntime> => ({
+      generation,
+      port,
+      inFlight: 0,
+      draining: false,
+      agent: new http.Agent({ keepAlive: true }),
+      markDraining() {},
+      async stop() {},
+    });
+    const supervisor = new RuntimeSupervisor({ workerPorts: ports, factory });
+    const runtime = await supervisor.start();
+    const front = http.createServer(supervisor.handle);
+    const frontPort = await listen(front);
+
+    try {
+      await new Promise<void>(resolve => {
+        const client = http.get(`http://127.0.0.1:${frontPort}/sse`, res => {
+          res.once('data', () => { client.destroy(); resolve(); });
+          res.once('error', () => {});
+        });
+        client.once('error', () => {});
+      });
+      await waitFor(() => sseCloses === 1, 2000);
+      await waitFor(() => runtime.inFlight === 0, 2000);
+      expect(sseCloses).toBe(1);
+      expect(runtime.inFlight).toBe(0);
+
+      // A normally completed response after a cancellation must still work
+      // over the same keep-alive agent.
+      const body = await fetch(`http://127.0.0.1:${frontPort}/plain`).then(response => response.text());
+      expect(body).toBe('ok');
+      expect(runtime.inFlight).toBe(0);
+    } finally {
+      runtime.agent.destroy();
+      await new Promise<void>(resolve => front.close(() => resolve()));
+      await new Promise<void>(resolve => worker.close(() => resolve()));
+    }
+  });
+
+  test('cancelling one stream does not damage an unrelated concurrent request', async () => {
+    const workerPort = await freePort();
+    const ports = [workerPort, await freePort()];
+    let releaseSlow!: () => void;
+    const slowGate = new Promise<void>(resolve => { releaseSlow = resolve; });
+    let sseCloses = 0;
+    const worker = http.createServer(async (req, res) => {
+      if (req.url === '/sse') {
+        res.writeHead(200, { 'content-type': 'text/event-stream' });
+        res.write('data: first\n\n');
+        res.once('close', () => { sseCloses++; });
+        return;
+      }
+      if (req.url === '/slow') await slowGate;
+      res.writeHead(200, { 'content-type': 'text/plain' });
+      res.end('slow-done');
+    });
+    await listen(worker, workerPort);
+    const factory = async (port: number, generation: string): Promise<ManagedRuntime> => ({
+      generation,
+      port,
+      inFlight: 0,
+      draining: false,
+      agent: new http.Agent({ keepAlive: true }),
+      markDraining() {},
+      async stop() {},
+    });
+    const supervisor = new RuntimeSupervisor({ workerPorts: ports, factory });
+    const runtime = await supervisor.start();
+    const front = http.createServer(supervisor.handle);
+    const frontPort = await listen(front);
+
+    try {
+      const slow = fetch(`http://127.0.0.1:${frontPort}/slow`).then(response => response.text());
+      await waitFor(() => runtime.inFlight === 1, 2000);
+
+      await new Promise<void>(resolve => {
+        const client = http.get(`http://127.0.0.1:${frontPort}/sse`, res => {
+          res.once('data', () => { client.destroy(); resolve(); });
+          res.once('error', () => {});
+        });
+        client.once('error', () => {});
+      });
+      await waitFor(() => sseCloses === 1, 2000);
+
+      releaseSlow();
+      await waitFor(() => runtime.inFlight === 0, 2000);
+      expect(await slow).toBe('slow-done');
+      expect(runtime.inFlight).toBe(0);
+    } finally {
+      try { releaseSlow(); } catch {}
+      runtime.agent.destroy();
+      await new Promise<void>(resolve => front.close(() => resolve()));
+      await new Promise<void>(resolve => worker.close(() => resolve()));
+    }
+  });
 });

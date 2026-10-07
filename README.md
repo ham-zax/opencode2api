@@ -29,6 +29,19 @@ Direct access to free AI tiers on OpenCode Zen often results in strict single-IP
 3. **Smart 429 Bypass & Failover**: Applying exponential backoff to rate-limited nodes while preserving prompt cache affinity on active nodes.
 4. **Drop-in OpenAI & OpenCode2 Compatibility**: Exposing standard `/v1/chat/completions` and `/v1/models` alongside a built-in web management dashboard.
 
+Generation requests have no automatic concurrency limit or pool admission queue,
+including when spare proxy capacity is degraded. Each key starts with three
+proxy routes and can grow to sixteen as concurrent demand rises; retained
+routes do not limit admitted requests. Sequential turns prefer their previous
+healthy exit, while parallel traffic can use a less-busy exit. Per-key concurrency and request
+limits default to `0` (unlimited); administrators can still set explicit limits.
+Upstream rate limits and proxy failures can still produce retryable errors.
+
+Upstream streams are buffered until a complete productive SSE event arrives,
+so early empty/error streams can fail over before delivery. The initial wait
+and buffer are bounded; streams are never replayed after handoff. Client
+disconnects cancel worker/upstream connections and release request occupancy.
+
 ---
 
 ## ✨ Key Features
@@ -311,14 +324,16 @@ OpenCode2API can be configured via environment variables in `docker-compose.yml`
 | `PORT` | `13339` | HTTP port for API and Dashboard. |
 | `API_KEY` | `admin123` | Default master administrator API key. |
 | `DATA_DIR` | `./data` | Directory for persistent storage (`keys.json`, `sources.json`, `audit.jsonl`). |
-| `SLOTS_PER_KEY` | `3` | Number of concurrent proxy slots allocated per API key. |
+| `SLOTS_PER_KEY` | `3` | Fixed minimum proxy routes per API key, not a generation concurrency limit. |
+| `MAX_PROXY_SLOTS_PER_KEY` | `16` | Maximum retained proxy routes per key as concurrent demand grows. Does not limit admitted generations. |
 | `MAX_ACTIVE_KEYS` | `20` | Maximum number of keys active simultaneously. |
 | `WARP_MODE` | `off` | Enable Cloudflare WARP fallback (`on` / `off` / `fallback`). |
 | `WARP_HOST` | `127.0.0.1` | Host address of local WARP SOCKS5 service. |
 | `WARP_SOCKS5_PORT`| `1080` | Port of WARP SOCKS5 service. |
 | `PROXY_REFRESH_MS`| `300000` | Interval (ms) for refreshing candidate proxy pools (5 min). |
+| `PROBER_INTERVAL_MS` | `60000` | Background reachability sweep interval. Healthy pools sample up to 40 candidates; low-capacity pools sample up to 120. |
 | `PROXY_CONNECT_TIMEOUT_MS` | `15000` | Timeout (ms) for establishing a proxy connection; kept separate from generation lifetime. |
-| `STREAM_FIRST_BYTE_TIMEOUT_MS` | `30000` | Maximum wait (ms) for the first upstream SSE bytes before the attempt is treated as stalled and can fail over. |
+| `STREAM_FIRST_BYTE_TIMEOUT_MS` | `30000` | Complete-attempt deadline (ms) for the first productive SSE event. Heartbeats and partial frames do not extend it; buffered prelude is capped at 1 MiB. |
 | `STREAM_IDLE_TIMEOUT_MS` | `600000` | Upstream SSE inactivity timeout (ms). Each received chunk refreshes the idle timer; this is not a total generation deadline. |
 | `CLASH_SUBSCRIBE_URLS`| *(FreeSub YAML)* | Comma-separated Clash/Mihomo subscription URLs. |
 | `PROXY_POOL_URL` | `""` | Optional external proxy pool API endpoint. |
