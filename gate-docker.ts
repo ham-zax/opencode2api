@@ -1847,6 +1847,22 @@ function releaseKeySlots(keyId: string): void {
   console.log(`[Release] Key ${keyId.slice(0,7)}... Released ${count} slots`);
 }
 
+function pruneGloballyUnusableSlots(pool: KeySlotPool): number {
+  let removed = 0;
+  pool.slots = pool.slots.filter(slot => {
+    if (isExitUsable(slot.addr, undefined)) return true;
+    const cand = candidates.find(c => c.address === slot.addr);
+    if (cand?.lockedBy === pool.keyId) cand.lockedBy = null;
+    removed++;
+    return false;
+  });
+  if (removed > 0) {
+    pool.rrCursor = pool.slots.length > 0 ? pool.rrCursor % pool.slots.length : 0;
+    console.log(`[Allocate] Key ${pool.keyId.slice(0, 7)}... Pruned ${removed} unusable cooldown slot(s)`);
+  }
+  return removed;
+}
+
 async function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): Promise<void> {
   if (keySlotPools.get(pool.keyId) !== pool) return;
   const idx = pool.slots.findIndex(s => s.addr === failedAddr);
@@ -1905,6 +1921,7 @@ async function getKeySlotPool(keyId: string): Promise<KeySlotPool | null> {
   const existing = keySlotPools.get(keyId);
   if (existing) {
     existing.lastUsedAt = Date.now();
+    pruneGloballyUnusableSlots(existing);
     if (existing.slots.length > 0) {
       // If all slots are fallback and candidates available, force re-allocation
       const warpAddr = getWarpAddr();
@@ -2438,13 +2455,20 @@ async function dispatch(
   }
 
   if (!selectedSlot) {
-    // Attempt recovery refill if pool has run dry
-    if (pool.slots.length === 0) {
-      console.log(`[Dispatch] Pool empty for Key ${pool.keyId.slice(0, 7)}..., attempting recovery refill`);
-      const refilled = await getKeySlotPool(pool.keyId);
-      if (refilled && refilled.slots.length > 0) {
-        pool.slots = refilled.slots;
-        selectedSlot = pool.slots[0];
+    // Recovery must be based on usable capacity, not raw slot count. A 429'd
+    // exit remains in the slot array during cooldown; treating that as a
+    // non-empty pool made requests skip replacement and fall straight through
+    // to the direct egress cooldown despite validated free exits being ready.
+    pruneGloballyUnusableSlots(pool);
+    console.log(`[Dispatch] No usable slot for Key ${pool.keyId.slice(0, 7)}..., attempting recovery refill`);
+    const refilled = await getKeySlotPool(pool.keyId);
+    if (refilled && refilled.slots.length > 0) {
+      pool = refilled;
+      for (const slot of pool.slots) {
+        if (triedAddrs.has(slot.addr)) continue;
+        if (!isExitUsable(slot.addr, dispatchModel)) continue;
+        selectedSlot = slot;
+        break;
       }
     }
   }

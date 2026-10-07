@@ -71,7 +71,7 @@ function fixture(probeTimeout = 2500) {
   });
   const gateway: any = vm.runInContext(definitions + `
     ({ coarseScreen, probe, backgroundProbeSweep, allocateKeySlots, loadCandidates,
-       replaceFailedSlot, getKeySlotPool, releaseKeySlots,
+       replaceFailedSlot, getKeySlotPool, releaseKeySlots, pruneGloballyUnusableSlots,
        freeExitCount, currentDemandKeyCount, operationalPoolTarget, currentPoolState, poolGenerationConcurrencyCap, waitForPoolGenerationCapacity, markValidated, noteExitFailure,
        isExitUsable, validatedExits, exitHealth, exitModelBans, keySlotPools, coarseSeen,
        saveProxyHealthState, loadProxyHealthState,
@@ -388,6 +388,29 @@ describe('proxy pool regression checks', () => {
     await g.replaceFailedSlot(pool, items[0].address);
     expect(probed).toEqual([items[3].address]);
     expect(pool.slots.map(s => s.addr)).toEqual([items[3].address]);
+  });
+
+  test('cooled attached slots are pruned and replaced before direct fallback', async () => {
+    const g = fixture();
+    const cooled = candidate(51, 'key-a');
+    const spare = candidate(52, null);
+    const spare2 = candidate(53, null);
+    const spare3 = candidate(54, null);
+    g.setCandidates([cooled, spare, spare2, spare3]);
+    g.keySlotPools.set('key-a', {
+      keyId: 'key-a', rrCursor: 0, lastUsedAt: g.now,
+      slots: [{ addr: cooled.address, url: `http://${cooled.address}`, proto: 'http', latencyMs: 100, qualityGrade: 'B' }],
+    });
+    g.noteExitFailure(cooled.address, 429);
+    g.setScreen(healthy);
+    g.setProbe(async (item: any) => ({ ok: item.address === spare.address, latencyMs: 100, country: 'US', reason: 'ok' }));
+
+    const pool = await g.getKeySlotPool('key-a');
+    expect(pool).not.toBeNull();
+    expect(pool.slots.some((slot: any) => slot.addr === cooled.address)).toBe(false);
+    expect(pool.slots.some((slot: any) => slot.addr === spare.address)).toBe(true);
+    expect(cooled.lockedBy).toBeNull();
+    expect(spare.lockedBy).toBe('key-a');
   });
 
   test('replacement cooldown expires even after a feed refresh', async () => {
