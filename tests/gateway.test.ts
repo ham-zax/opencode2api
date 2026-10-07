@@ -60,6 +60,7 @@ function fixture(probeTimeout = 2500) {
           now += latency;
           const res = new EventEmitter() as any;
           res.statusCode = replyStatus;
+          res.headers = {};
           callback(res);
           res.emit('data', Buffer.from(JSON.stringify(reply)));
           res.emit('end');
@@ -191,6 +192,17 @@ describe('proxy pool regression checks', () => {
     await g.backgroundProbeSweep();
     await g.backgroundProbeSweep();
     expect(checked.size).toBe(items.length);
+  });
+
+  test('direct stream health is decided at terminal completion, not first chunk', async () => {
+    const g = fixture();
+    const pool = { keyId: 'key', slots: [], rrCursor: 0, lastUsedAt: g.now };
+    const body = JSON.stringify({ model: 'muse-spark-1.3-contributor-free', input: 'Hi', stream: true });
+    g.echo({ type: 'response.output_text.delta', delta: 'partial' }, 100, 200);
+    const result = await g.dispatchDirect('/v1/responses', 'POST', { 'content-type': 'application/json' }, body, pool);
+    expect(result.status).toBe(200);
+    await expect(new Response(result.stream).text()).rejects.toThrow('terminal event');
+    expect(g.exitHealth.get('__direct__')?.fails).toBe(1);
   });
 
   test('direct fallback respects its own 429 cooldown instead of hammering the same egress', async () => {

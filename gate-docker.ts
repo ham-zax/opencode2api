@@ -2110,10 +2110,21 @@ async function dispatchDirect(
       const result = await doHttpsStream(path, method, headers, body, undefined);
       const latencyMs = Date.now() - start;
       if (result.status >= 200 && result.status < 400) {
-        stats.total++; stats.success++;
-        noteExitSuccess(DIRECT_EXIT_ADDR, dispatchModel);
+        stats.total++;
         audit(result.status, latencyMs, 'direct', path, body, pool.keyId);
-        return { status: result.status, stream: result.stream, streamHeaders: result.headers };
+        const monitored = monitorUpstreamSse(result.stream, path.includes('/responses') ? 'responses' : 'chat', {
+          onComplete: () => {
+            stats.success++;
+            noteExitSuccess(DIRECT_EXIT_ADDR, dispatchModel);
+            console.log('[Dispatch] direct stream completed cleanly');
+          },
+          onFailure: (error) => {
+            stats.errors++;
+            const verdict = noteExitFailure(DIRECT_EXIT_ADDR, 0, dispatchModel);
+            console.warn(`[Dispatch] direct stream failed after handoff: ${error.message} -> ${verdict}`);
+          },
+        });
+        return { status: result.status, stream: monitored, streamHeaders: result.headers };
       }
       stats.total++;
       if (result.status === 429) {
