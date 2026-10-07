@@ -127,7 +127,7 @@ describe('proxy pool regression checks', () => {
     for (const c of items.slice(0, 3)) g.markValidated(c.address);
     g.noteExitFailure(items[2].address, 429);
     expect(g.freeExitCount()).toBe(1);
-    expect(g.currentPoolState()).toBe('emergency');
+    expect(g.currentPoolState()).toBe('degraded');
     g.advance(15 * 60_000 + 1);
     expect(g.freeExitCount()).toBe(0);
   });

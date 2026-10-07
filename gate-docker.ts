@@ -1200,15 +1200,15 @@ async function measureProxy(item: ProxyItem): Promise<{ ok: boolean; latencyMs: 
 // GoProxy). How much free capacity the pool has decides how strict admission
 // is and which sources get scraped. Without this the admission ceiling is
 // either too tight to fill slots or too loose to keep slow, lossy proxies.
-type PoolState = 'healthy' | 'warning' | 'critical' | 'emergency';
+type PoolState = 'healthy' | 'watch' | 'constrained' | 'degraded';
 
 // Free (unlocked) exits needed to serve every key without contention.
 const POOL_TARGET = Math.max(60, SLOTS_PER_KEY * MAX_ACTIVE_KEYS * 2);
 const POOL_TIERS: Record<PoolState, { min: number; admitMs: number; scrapeAll: boolean }> = {
   healthy:   { min: POOL_TARGET,      admitMs: 1200, scrapeAll: false },
-  warning:   { min: Math.round(POOL_TARGET * 0.4), admitMs: 2000, scrapeAll: false },
-  critical:  { min: Math.round(POOL_TARGET * 0.15), admitMs: 3500, scrapeAll: true },
-  emergency: { min: 0,               admitMs: 0,    scrapeAll: true },
+  watch:      { min: Math.round(POOL_TARGET * 0.4), admitMs: 2000, scrapeAll: false },
+  constrained:{ min: Math.round(POOL_TARGET * 0.15), admitMs: 3500, scrapeAll: true },
+  degraded:   { min: 0,               admitMs: 0,    scrapeAll: true },
 };
 
 // Only exits that have actually answered a coarse screen count towards pool
@@ -1241,9 +1241,9 @@ function freeExitCount(): number {
 function currentPoolState(): PoolState {
   const free = freeExitCount();
   if (free >= POOL_TIERS.healthy.min) return 'healthy';
-  if (free >= POOL_TIERS.warning.min) return 'warning';
-  if (free >= POOL_TIERS.critical.min) return 'critical';
-  return 'emergency';
+  if (free >= POOL_TIERS.watch.min) return 'watch';
+  if (free >= POOL_TIERS.constrained.min) return 'constrained';
+  return 'degraded';
 }
 
 /** Latency ceiling for admitting a new exit right now. */
@@ -2280,9 +2280,9 @@ async function dispatch(
   }
 
   if (!selectedSlot) {
-    // Attempt emergency refill if pool has run dry
+    // Attempt recovery refill if pool has run dry
     if (pool.slots.length === 0) {
-      console.log(`[Dispatch] Pool empty for Key ${pool.keyId.slice(0, 7)}..., attempting emergency refill`);
+      console.log(`[Dispatch] Pool empty for Key ${pool.keyId.slice(0, 7)}..., attempting recovery refill`);
       const refilled = await getKeySlotPool(pool.keyId);
       if (refilled && refilled.slots.length > 0) {
         pool.slots = refilled.slots;
