@@ -86,7 +86,7 @@ function fixture(probeTimeout = 2500) {
        setModels(value) { cachedModels = value; cachedModelsTime = Date.now(); },
        activeRequests, fetchModelsFromUpstream, ensureModelCatalog, loadModelCatalog,
        normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, collectHeadersFromReq,
-       monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect,
+       monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect, sendJson,
        probeFreeModel, verifyFreeModels, freeModelHealth, workingFreeModelIds, hasModelOutput,
        catalogStatus,
        setFetcher(value) { fetchJsonDirect = value; },
@@ -416,6 +416,21 @@ describe('HTTP compatibility', () => {
       expect(doc.directEgress.usable).toBe(true);
       expect(doc.directEgress.retryAfterSeconds).toBe(0);
     });
+  });
+
+  test('gateway-generated 503 responses also include Retry-After', () => {
+    const g = fixture();
+    let status = 0;
+    let responseHeaders: Record<string, string> = {};
+    let body = '';
+    const res = {
+      writeHead(nextStatus: number, nextHeaders: Record<string, string>) { status = nextStatus; responseHeaders = nextHeaders; },
+      end(value: string) { body = value; },
+    } as any;
+    g.sendJson(res, 503, { error: 'temporarily_unavailable' });
+    expect(status).toBe(503);
+    expect(responseHeaders['retry-after']).toBe('30');
+    expect(JSON.parse(body).error).toBe('temporarily_unavailable');
   });
 
   test('models require a valid key and support the /openai prefix', async () => {

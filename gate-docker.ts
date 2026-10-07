@@ -2506,6 +2506,7 @@ function sendJson(nodeRes: http.ServerResponse, status: number, data: any) {
   nodeRes.writeHead(status, {
     'content-type': 'application/json',
     'access-control-allow-origin': '*',
+    ...retryResponseHeaders(status, undefined),
   });
   nodeRes.end(body);
 }
