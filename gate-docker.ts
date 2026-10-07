@@ -330,6 +330,9 @@ let runtimeDraining = false;
 const MAX_RETRIES = 3;
 const TIMEOUT = 15000;
 const STREAM_FIRST_BYTE_TIMEOUT_MS = parseInt(process.env.STREAM_FIRST_BYTE_TIMEOUT_MS || '30000');
+// Reasoning models may emit only keep-alives for a while before the first token,
+// so the productive-event deadline is deliberately looser than the first-byte one.
+const STREAM_FIRST_EVENT_TIMEOUT_MS = Math.max(STREAM_FIRST_BYTE_TIMEOUT_MS, parseInt(process.env.STREAM_FIRST_EVENT_TIMEOUT_MS || '120000') || 120000);
 const STREAM_IDLE_TIMEOUT_MS = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS || '600000');
 const PROXY_CONNECT_TIMEOUT_MS = parseInt(process.env.PROXY_CONNECT_TIMEOUT_MS || '15000');
 
@@ -925,12 +928,44 @@ function loadKeys() {
   }
 }
 
+// Usage counters are additive: during a supervised reload two generations
+// serve the same keys.json, so each process remembers what it added since its
+// last save and merges that onto whatever is on disk instead of overwriting it.
+interface KeyUsageDelta { totalRequests: number; requestCount: number; totalTokens: number; lastUsedAt: number }
+const keyUsageDeltas = new Map<string, KeyUsageDelta>();
+
+function noteKeyUsage(key: string, patch: Partial<KeyUsageDelta>): void {
+  const delta = keyUsageDeltas.get(key) || { totalRequests: 0, requestCount: 0, totalTokens: 0, lastUsedAt: 0 };
+  delta.totalRequests += patch.totalRequests || 0;
+  delta.requestCount += patch.requestCount || 0;
+  delta.totalTokens += patch.totalTokens || 0;
+  delta.lastUsedAt = Math.max(delta.lastUsedAt, patch.lastUsedAt || 0);
+  keyUsageDeltas.set(key, delta);
+}
+
+function mergeKeyCounters(target: ApiKeyRecord, onDisk: ApiKeyRecord, delta: KeyUsageDelta | undefined): void {
+  target.totalRequests = (onDisk.totalRequests || 0) + (delta?.totalRequests || 0);
+  target.requestCount = (onDisk.requestCount || 0) + (delta?.requestCount || 0);
+  target.totalTokens = (onDisk.totalTokens || 0) + (delta?.totalTokens || 0);
+  target.lastUsedAt = Math.max(onDisk.lastUsedAt || 0, delta?.lastUsedAt || 0, target.lastUsedAt || 0);
+}
+
 function saveKeys() {
-  if (runtimeDraining) return;
   try {
+    let onDisk: Record<string, ApiKeyRecord> = {};
+    try { onDisk = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf-8')); } catch {}
+    // A draining generation must not resurrect or edit keys; it only adds its
+    // remaining usage to records that still exist on disk.
+    if (runtimeDraining && !Object.keys(onDisk).length) return;
+    const next = runtimeDraining ? onDisk : apiKeys;
+    for (const [key, record] of Object.entries(next)) {
+      const existing = onDisk[key];
+      if (existing) mergeKeyCounters(record, existing, keyUsageDeltas.get(key));
+    }
     const tmp = `${KEYS_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(apiKeys, null, 2), 'utf-8');
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf-8');
     fs.renameSync(tmp, KEYS_FILE);
+    keyUsageDeltas.clear();
   } catch (e: any) {
     console.error(`[Keys] Save failed: ${e.message}`);
   }
@@ -960,6 +995,7 @@ function recordKeyRequest(key: string) {
   record.lastUsedAt = Date.now();
   record.totalRequests++;
   record.requestCount++;
+  noteKeyUsage(key, { totalRequests: 1, requestCount: 1, lastUsedAt: record.lastUsedAt });
   saveKeys();
 }
 
@@ -968,6 +1004,7 @@ function recordKeyUsage(key: string, tokens: number) {
   if (record) {
     record.lastUsedAt = Date.now();
     record.totalTokens += tokens;
+    noteKeyUsage(key, { totalTokens: tokens, lastUsedAt: record.lastUsedAt });
     saveKeys();
   }
 }
@@ -1860,6 +1897,16 @@ function pruneGloballyUnusableSlots(pool: KeySlotPool): number {
 }
 
 const keyPoolTopups = new Map<string, { pool: KeySlotPool; work: Promise<number> }>();
+// A top-up that found nothing must not be retried by every incoming request.
+const TOPUP_EMPTY_BACKOFF_MS = 5000;
+const keyTopUpBackoffUntil = new Map<string, number>();
+
+// Request-path replenishment: the request already has usable slots, so grow
+// the pool behind it instead of making it wait for probes.
+function replenishInBackground(pool: KeySlotPool): void {
+  if ((keyTopUpBackoffUntil.get(pool.keyId) || 0) > Date.now()) return;
+  topUpKeySlotPool(pool).catch(e => console.warn(`[Allocate+] background top-up failed: ${e?.message || e}`));
+}
 
 function desiredProxySlots(key: string): number {
   return Math.min(MAX_PROXY_SLOTS_PER_KEY, Math.max(SLOTS_PER_KEY, activeRequests[key] || 0));
@@ -1903,6 +1950,8 @@ async function topUpKeySlotPool(pool: KeySlotPool, model?: string): Promise<numb
         console.log(`[Allocate+] ${cand.address} → Key ${pool.keyId.slice(0, 7)}... top-up ${pool.slots.length}/${target()}`);
       }
     }
+    if (added > 0) keyTopUpBackoffUntil.delete(pool.keyId);
+    else keyTopUpBackoffUntil.set(pool.keyId, Date.now() + TOPUP_EMPTY_BACKOFF_MS);
     return added;
   })();
   keyPoolTopups.set(pool.keyId, { pool, work });
@@ -1978,7 +2027,7 @@ async function getKeySlotPool(keyId: string): Promise<KeySlotPool | null> {
         console.log(`[Allocate] Key ${keyId.slice(0,7)}... All fallback slots, candidate pool available, re-allocating`);
         keySlotPools.delete(keyId);
       } else {
-        if (existing.slots.length < desiredProxySlots(keyId)) await topUpKeySlotPool(existing);
+        if (existing.slots.length < desiredProxySlots(keyId)) replenishInBackground(existing);
         return existing;
       }
     }
@@ -2205,7 +2254,7 @@ function doHttpsStream(
     req.on('socket', socket => { try { socket.setKeepAlive(true, 30_000); } catch {} });
     req.on('error', fail);
     req.on('timeout', () => fail(new Error('Upstream stream inactivity timeout')));
-    timer = setTimeout(() => fail(new Error('Upstream first SSE event timeout')), STREAM_FIRST_BYTE_TIMEOUT_MS);
+    timer = setTimeout(() => fail(new Error('Upstream first SSE event timeout')), STREAM_FIRST_EVENT_TIMEOUT_MS);
     signal?.addEventListener('abort', onAbort, { once: true });
     if (signal?.aborted) { onAbort(); return; }
     if (body) req.write(body);
@@ -3745,6 +3794,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       timeouts: {
         nonStreamMs: TIMEOUT,
         streamFirstByteMs: STREAM_FIRST_BYTE_TIMEOUT_MS,
+        streamFirstEventMs: STREAM_FIRST_EVENT_TIMEOUT_MS,
         streamIdleMs: STREAM_IDLE_TIMEOUT_MS,
         proxyConnectMs: PROXY_CONNECT_TIMEOUT_MS,
         proxyProbeMs: PROXY_PROBE_TIMEOUT,
@@ -4715,9 +4765,9 @@ async function main() {
   setInterval(verifyFreeModels, MODEL_VERIFY_INTERVAL_MS);
 
   // Start HTTP server
-  process.on('SIGUSR1', () => {
+  if (process.env.SUPERVISED_RUNTIME === '1') process.on('SIGUSR1', () => {
     runtimeDraining = true;
-    console.log('[Runtime] Drain mode enabled; shared state persistence paused');
+    console.log('[Runtime] Drain mode enabled; only key usage counters are still persisted');
   });
 
   server.listen(PORT, HOST, () => {

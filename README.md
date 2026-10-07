@@ -161,7 +161,12 @@ bun test
 ./scripts/reload-runtime.sh
 ```
 
-`SIGHUP` starts a replacement worker, waits for its `/api/status` health check and runtime-generation marker, switches new requests atomically, then drains the previous worker. Inspect the routing layer at `GET /__supervisor/status`.
+`SIGHUP` starts a replacement worker, waits for its `/api/status` health check and runtime-generation marker, switches new requests atomically, then drains the previous worker. Inspect the routing layer at `GET /__supervisor/status` (loopback clients only). `scripts/reload-runtime.sh` waits up to `OPENCODE2API_RELOAD_WAIT_SECONDS` (default 150) for the new generation.
+
+Notes:
+- If the active worker crashes, the supervisor starts a replacement automatically; `SIGTERM`/`SIGINT` stops all workers.
+- Key usage counters (`totalRequests`, `requestCount`, `totalTokens`, `lastUsedAt`) are merged additively into `keys.json`, so usage from both generations during an overlap is kept. The merge is read-modify-write, so a very small race window remains between processes.
+- Per-key `maxConcurrency` is enforced separately by each generation, so during a reload overlap a key may briefly exceed its limit.
 
 ---
 
@@ -333,7 +338,9 @@ OpenCode2API can be configured via environment variables in `docker-compose.yml`
 | `PROXY_REFRESH_MS`| `300000` | Interval (ms) for refreshing candidate proxy pools (5 min). |
 | `PROBER_INTERVAL_MS` | `60000` | Background reachability sweep interval. Healthy pools sample up to 40 candidates; low-capacity pools sample up to 120. |
 | `PROXY_CONNECT_TIMEOUT_MS` | `15000` | Timeout (ms) for establishing a proxy connection; kept separate from generation lifetime. |
-| `STREAM_FIRST_BYTE_TIMEOUT_MS` | `30000` | Complete-attempt deadline (ms) for the first productive SSE event. Heartbeats and partial frames do not extend it; buffered prelude is capped at 1 MiB. |
+| `STREAM_FIRST_BYTE_TIMEOUT_MS` | `30000` | Socket timeout (ms) while waiting for the upstream response to start. |
+| `STREAM_FIRST_EVENT_TIMEOUT_MS` | `120000` | Complete-attempt deadline (ms) for the first productive SSE event (never below `STREAM_FIRST_BYTE_TIMEOUT_MS`). Heartbeats and partial frames do not extend it; buffered prelude is capped at 1 MiB. |
+| `WORKER_READY_TIMEOUT_MS` | `120000` | Supervisor: how long a replacement worker may take to pass its readiness check. |
 | `STREAM_IDLE_TIMEOUT_MS` | `600000` | Upstream SSE inactivity timeout (ms). Each received chunk refreshes the idle timer; this is not a total generation deadline. |
 | `CLASH_SUBSCRIBE_URLS`| *(FreeSub YAML)* | Comma-separated Clash/Mihomo subscription URLs. |
 | `PROXY_POOL_URL` | `""` | Optional external proxy pool API endpoint. |

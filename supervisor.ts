@@ -12,6 +12,8 @@ export interface ManagedRuntime {
   agent: http.Agent;
   markDraining(): void;
   stop(force?: boolean): Promise<void>;
+  /** Calls the listener once if the runtime's process ends on its own (or already has). */
+  onExit?(listener: () => void): void;
 }
 
 export type RuntimeFactory = (port: number, generation: string) => Promise<ManagedRuntime>;
@@ -20,10 +22,20 @@ export interface RuntimeSupervisorOptions {
   workerPorts: number[];
   factory: RuntimeFactory;
   drainTimeoutMs?: number;
+  /** First delay before retrying a replacement after the active runtime died. */
+  recoverDelayMs?: number;
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// The status document describes deploy state, so only answer local callers
+// (reload script, operators); anything forwarded or remote is proxied as usual.
+function isLoopbackRequest(req: http.IncomingMessage): boolean {
+  const address = req.socket.remoteAddress;
+  const local = address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+  return local && !req.headers['x-forwarded-for'];
 }
 
 export function chooseStandbyPort(activePort: number | null, ports: number[], unavailable: Iterable<number> = []): number {
@@ -39,7 +51,10 @@ export class RuntimeSupervisor {
   private readonly workerPorts: number[];
   private readonly factory: RuntimeFactory;
   private readonly drainTimeoutMs: number;
+  private readonly recoverDelayMs: number;
   private generationCounter = 0;
+  private recovering = false;
+  private stopping = false;
   private reloadPromise: Promise<ManagedRuntime> | null = null;
   active: ManagedRuntime | null = null;
   draining = new Set<ManagedRuntime>();
@@ -48,6 +63,7 @@ export class RuntimeSupervisor {
     this.workerPorts = options.workerPorts;
     this.factory = options.factory;
     this.drainTimeoutMs = options.drainTimeoutMs ?? 15 * 60_000;
+    this.recoverDelayMs = options.recoverDelayMs ?? 1000;
   }
 
   private nextGeneration(): string {
@@ -57,9 +73,54 @@ export class RuntimeSupervisor {
 
   async start(): Promise<ManagedRuntime> {
     if (this.active) return this.active;
-    const runtime = await this.factory(chooseStandbyPort(null, this.workerPorts), this.nextGeneration());
-    this.active = runtime;
+    const runtime = await this.factory(
+      chooseStandbyPort(null, this.workerPorts, [...this.draining].map(draining => draining.port)),
+      this.nextGeneration(),
+    );
+    this.activate(runtime);
     return runtime;
+  }
+
+  private activate(runtime: ManagedRuntime): void {
+    this.active = runtime;
+    runtime.onExit?.(() => this.handleExit(runtime));
+  }
+
+  // A worker that dies on its own would otherwise leave the supervisor routing
+  // to a dead port forever (systemd only sees the supervisor, which stays up).
+  private handleExit(runtime: ManagedRuntime): void {
+    if (this.stopping || this.active !== runtime) return;
+    console.error(`[Supervisor] Active worker generation=${runtime.generation} port=${runtime.port} exited unexpectedly`);
+    this.active = null;
+    try { runtime.agent.destroy(); } catch {}
+    void this.recover();
+  }
+
+  private async recover(): Promise<void> {
+    if (this.recovering) return;
+    this.recovering = true;
+    let delay = this.recoverDelayMs;
+    try {
+      while (!this.stopping && !this.active) {
+        try {
+          const runtime = await this.reload();
+          console.log(`[Supervisor] Recovered; active worker=${runtime.port} generation=${runtime.generation}`);
+        } catch (error: any) {
+          console.error('[Supervisor] Recovery failed, retrying:', error?.message || error);
+          await sleep(delay);
+          delay = Math.min(delay * 2, 30_000);
+        }
+      }
+    } finally {
+      this.recovering = false;
+    }
+  }
+
+  /** Stops supervising: no recovery attempts, and all workers are stopped. */
+  async shutdown(): Promise<void> {
+    this.stopping = true;
+    const runtimes = [this.active, ...this.draining].filter(Boolean) as ManagedRuntime[];
+    await Promise.all(runtimes.map(runtime => runtime.stop(true).catch(() => {})));
   }
 
   async reload(): Promise<ManagedRuntime> {
@@ -72,11 +133,15 @@ export class RuntimeSupervisor {
         [...this.draining].map(runtime => runtime.port),
       );
       const next = await this.factory(port, this.nextGeneration());
+      if (this.stopping) {
+        await next.stop(true).catch(() => {});
+        throw new Error('Supervisor is shutting down');
+      }
 
       // Atomic routing switch: every request accepted after this assignment
       // goes to the validated replacement. Existing proxy requests keep their
       // already-open connection to the old runtime.
-      this.active = next;
+      this.activate(next);
 
       if (old) {
         old.draining = true;
@@ -95,12 +160,18 @@ export class RuntimeSupervisor {
   }
 
   private async drainAndStop(runtime: ManagedRuntime): Promise<void> {
-    const deadline = Date.now() + this.drainTimeoutMs;
-    while (runtime.inFlight > 0 && Date.now() < deadline) await sleep(100);
-    const force = runtime.inFlight > 0;
-    await runtime.stop(force);
-    runtime.agent.destroy();
-    this.draining.delete(runtime);
+    try {
+      const deadline = Date.now() + this.drainTimeoutMs;
+      while (runtime.inFlight > 0 && Date.now() < deadline) await sleep(100);
+      const force = runtime.inFlight > 0;
+      await runtime.stop(force);
+    } catch (error: any) {
+      console.error(`[Supervisor] Failed to stop drained generation=${runtime.generation}:`, error?.message || error);
+    } finally {
+      try { runtime.agent.destroy(); } catch {}
+      // Always release the worker port, otherwise two-port setups could never reload again.
+      this.draining.delete(runtime);
+    }
   }
 
   status() {
@@ -120,7 +191,7 @@ export class RuntimeSupervisor {
   }
 
   handle = (req: http.IncomingMessage, res: http.ServerResponse) => {
-    if (req.url === '/__supervisor/status' && req.method === 'GET') {
+    if (req.url === '/__supervisor/status' && req.method === 'GET' && isLoopbackRequest(req)) {
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify(this.status()));
       return;
@@ -230,11 +301,16 @@ const DRAIN_TIMEOUT_MS = parseInt(process.env.DRAIN_TIMEOUT_MS || '900000');
 const BUN_BIN = process.env.BUN_BIN || process.execPath;
 const ROOT = process.cwd();
 
+function hasExited(child: ChildProcess): boolean {
+  // A signal-terminated child has exitCode === null but signalCode set.
+  return child.exitCode != null || child.signalCode != null;
+}
+
 async function waitForWorker(port: number, generation: string, child: ChildProcess): Promise<void> {
   const deadline = Date.now() + WORKER_READY_TIMEOUT_MS;
   let lastError = 'worker not ready';
   while (Date.now() < deadline) {
-    if (child.exitCode != null) throw new Error(`worker exited before readiness (code=${child.exitCode})`);
+    if (hasExited(child)) throw new Error(`worker exited before readiness (code=${child.exitCode ?? child.signalCode})`);
     try {
       const response = await fetch(`http://127.0.0.1:${port}/api/status`, { signal: AbortSignal.timeout(2000) });
       if (response.ok) {
@@ -270,6 +346,10 @@ function productionFactory(): RuntimeFactory {
       await waitForWorker(port, generation, child);
     } catch (error) {
       try { child.kill('SIGTERM'); } catch {}
+      // Let the failed worker release its port before a retry can reuse it.
+      const deadline = Date.now() + 5000;
+      while (!hasExited(child) && Date.now() < deadline) await sleep(50);
+      if (!hasExited(child)) try { child.kill('SIGKILL'); } catch {}
       throw error;
     }
 
@@ -278,16 +358,20 @@ function productionFactory(): RuntimeFactory {
       port,
       inFlight: 0,
       draining: false,
-      agent: new http.Agent({ keepAlive: true, maxSockets: 256 }),
+      agent: new http.Agent({ keepAlive: true }),
       markDraining() {
-        if (child.exitCode == null) child.kill('SIGUSR1');
+        if (!hasExited(child)) child.kill('SIGUSR1');
       },
       async stop(force = false) {
-        if (child.exitCode != null) return;
+        if (hasExited(child)) return;
         child.kill(force ? 'SIGKILL' : 'SIGTERM');
         const deadline = Date.now() + 5000;
-        while (child.exitCode == null && Date.now() < deadline) await sleep(50);
-        if (child.exitCode == null) child.kill('SIGKILL');
+        while (!hasExited(child) && Date.now() < deadline) await sleep(50);
+        if (!hasExited(child)) child.kill('SIGKILL');
+      },
+      onExit(listener) {
+        if (hasExited(child)) queueMicrotask(listener);
+        else child.once('exit', listener);
       },
     };
     return runtime;
@@ -315,8 +399,7 @@ export async function main() {
 
   const shutdown = async () => {
     server.close();
-    const runtimes = [supervisor.active, ...supervisor.draining].filter(Boolean) as ManagedRuntime[];
-    await Promise.all(runtimes.map(runtime => runtime.stop(true).catch(() => {})));
+    await supervisor.shutdown();
     process.exit(0);
   };
   process.on('SIGTERM', () => { void shutdown(); });

@@ -83,7 +83,9 @@ function fixture(probeTimeout = 2500) {
        choosePoolSlot, exitActiveRequests, sessionExits, dispatch, doHttpsStream, initialSseEvent, readBody,
        freeExitCount, currentDemandKeyCount, operationalPoolTarget, currentPoolState, markValidated, noteExitFailure, noteExitSuccess,
        isExitUsable, validatedExits, exitHealth, exitModelBans, keySlotPools, coarseSeen,
-       saveProxyHealthState, loadProxyHealthState,
+       saveProxyHealthState, loadProxyHealthState, recordKeyRequest, recordKeyUsage, saveKeys,
+       getKeysFile() { return KEYS_FILE; },
+       setDraining(value) { runtimeDraining = value; },
        setCandidates(value) { candidates = value; },
        getCandidates() { return candidates; },
        setSources(value) { proxySources = value; },
@@ -116,6 +118,8 @@ function fixture(probeTimeout = 2500) {
     cache(doc: any) { stateFiles.set(path.resolve(import.meta.dir, '../models_cache.json'), JSON.stringify(doc)); },
     get cachedDoc() { const value = stateFiles.get(path.resolve(import.meta.dir, '../models_cache.json')); return value ? JSON.parse(value) : undefined; },
     get healthDoc() { const value = stateFiles.get(path.resolve(import.meta.dir, '../proxy_health_cache.json')); return value ? JSON.parse(value) : undefined; },
+    seedState(file: string, value: any) { stateFiles.set(file, JSON.stringify(value)); },
+    readState(file: string) { const value = stateFiles.get(file); return value ? JSON.parse(value) : undefined; },
     hang() { hang = true; },
     fireTimers(delay: number) {
       for (const entry of timers.filter(t => t.delay === delay)) {
@@ -480,6 +484,43 @@ describe('proxy pool regression checks', () => {
     await g.replaceFailedSlot(stale, c.address);
     expect(c.lockedBy).toBe('second');
     expect(stale.slots).toHaveLength(1);
+  });
+});
+
+describe('shared key usage persistence', () => {
+  const record = (name: string, n: number) => ({
+    key: 'k', name, enabled: true, createdAt: 1, lastUsedAt: 0,
+    totalRequests: n, requestCount: n, totalTokens: n * 10, maxConcurrency: 0, maxRequests: 0, expiresAt: 0,
+  });
+
+  test('a generation adds its usage to counters written by another generation', () => {
+    const g = fixture();
+    const file = g.getKeysFile();
+    g.seedState(file, { k: record('disk', 10) });
+    g.setKeys({ k: record('mem', 10) });
+    g.seedState(file, { k: record('disk', 15) });
+    g.recordKeyRequest('k');
+    g.recordKeyUsage('k', 7);
+    const saved = g.readState(file).k;
+    expect(saved.totalRequests).toBe(16);
+    expect(saved.requestCount).toBe(16);
+    expect(saved.totalTokens).toBe(157);
+    expect(g.getKeys().k.totalRequests).toBe(16);
+  });
+
+  test('a draining generation persists only usage and never edits or resurrects keys', () => {
+    const g = fixture();
+    const file = g.getKeysFile();
+    g.setKeys({ k: record('mem', 10), gone: { ...record('gone', 1), key: 'gone' } });
+    g.seedState(file, { k: record('disk', 20) });
+    g.setDraining(true);
+    g.recordKeyUsage('k', 50);
+    g.recordKeyUsage('gone', 5);
+    const saved = g.readState(file);
+    expect(saved.k.name).toBe('disk');
+    expect(saved.k.totalRequests).toBe(20);
+    expect(saved.k.totalTokens).toBe(250);
+    expect(saved.gone).toBeUndefined();
   });
 });
 
@@ -1133,6 +1174,9 @@ describe('stream admission and exit routing', () => {
     const pending = g.doHttpsStream('/v1/chat/completions', 'POST', {}, body);
     await new Promise(resolve => queueMicrotask(resolve));
     g.fireTimers(30000);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    expect(g.destroyedRequests).toBe(0);
+    g.fireTimers(120000);
     await expect(pending).rejects.toThrow('first SSE event timeout');
     expect(g.destroyedRequests).toBe(1);
   });
@@ -1278,9 +1322,45 @@ describe('stream admission and exit routing', () => {
     g.setProbe(async () => ({ ok: true, latencyMs: 100 }));
     const [a, b] = await Promise.all([g.getKeySlotPool('key'), g.getKeySlotPool('key')]);
     expect(a).toBe(b);
+    await g.topUpKeySlotPool(p);
     expect(p.slots).toHaveLength(16);
     expect(g.activeRequests.key).toBe(25);
     expect(new Set(p.slots.map((s: any) => s.addr)).size).toBe(16);
+  });
+
+  test('request path never waits for pool replenishment', async () => {
+    const g = fixture();
+    const items = Array.from({ length: 6 }, (_, i) => candidate(i + 1, i < 3 ? 'key' : null));
+    const p = pool(...items.slice(0, 3).map(c => c.address));
+    g.setCandidates(items);
+    g.keySlotPools.set('key', p);
+    for (const c of items) g.markValidated(c.address);
+    g.activeRequests.key = 6;
+    g.setProbe(() => new Promise(() => {}));
+    const served = await Promise.race([
+      g.getKeySlotPool('key'),
+      new Promise(resolve => setTimeout(() => resolve('blocked'), 50)),
+    ]);
+    expect(served).toBe(p);
+  });
+
+  test('an empty top-up is not retried by every following request', async () => {
+    const g = fixture();
+    const items = Array.from({ length: 6 }, (_, i) => candidate(i + 1, i < 3 ? 'key' : null));
+    const p = pool(...items.slice(0, 3).map(c => c.address));
+    g.setCandidates(items);
+    g.keySlotPools.set('key', p);
+    for (const c of items) g.markValidated(c.address);
+    g.activeRequests.key = 6;
+    let probes = 0;
+    g.setProbe(async () => { probes++; return { ok: false, latencyMs: 0 }; });
+    await g.getKeySlotPool('key');
+    await g.topUpKeySlotPool(p);
+    const afterFirst = probes;
+    expect(afterFirst).toBeGreaterThan(0);
+    for (let i = 0; i < 5; i++) await g.getKeySlotPool('key');
+    await new Promise(resolve => setTimeout(resolve, 5));
+    expect(probes).toBe(afterFirst);
   });
 
   test('a fresh pool grows when parallel demand arrives during its initial allocation', async () => {

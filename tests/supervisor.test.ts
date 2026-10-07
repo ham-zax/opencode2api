@@ -272,4 +272,96 @@ describe('runtime supervisor', () => {
       await new Promise<void>(resolve => worker.close(() => resolve()));
     }
   });
+
+  function crashableFactory() {
+    const created: { generation: string; port: number; crash(): void; stopped: boolean }[] = [];
+    const factory = async (port: number, generation: string): Promise<ManagedRuntime> => {
+      let exitListener: (() => void) | undefined;
+      const entry = {
+        generation, port, stopped: false,
+        crash() { exitListener?.(); },
+      };
+      created.push(entry);
+      return {
+        generation,
+        port,
+        inFlight: 0,
+        draining: false,
+        agent: new http.Agent({ keepAlive: true }),
+        markDraining() {},
+        onExit(listener) { exitListener = listener; },
+        async stop() { entry.stopped = true; },
+      };
+    };
+    return { created, factory };
+  }
+
+  test('an active worker that exits unexpectedly is replaced automatically', async () => {
+    const { created, factory } = crashableFactory();
+    const supervisor = new RuntimeSupervisor({ workerPorts: [13439, 13440], factory, recoverDelayMs: 5 });
+    const first = await supervisor.start();
+    created[0]!.crash();
+    expect(supervisor.active).toBeNull();
+    await waitFor(() => supervisor.active !== null);
+    expect(supervisor.active).not.toBe(first);
+    expect(created).toHaveLength(2);
+    await supervisor.shutdown();
+  });
+
+  test('recovery retries until a replacement worker starts', async () => {
+    const { created, factory: inner } = crashableFactory();
+    let failures = 2;
+    const factory = async (port: number, generation: string) => {
+      if (created.length >= 1 && failures-- > 0) throw new Error('not ready');
+      return inner(port, generation);
+    };
+    const supervisor = new RuntimeSupervisor({ workerPorts: [13439, 13440], factory, recoverDelayMs: 5 });
+    await supervisor.start();
+    created[0]!.crash();
+    await waitFor(() => supervisor.active !== null, 2000);
+    expect(failures).toBeLessThan(0);
+    await supervisor.shutdown();
+  });
+
+  test('the exit of a draining worker does not trigger recovery', async () => {
+    const { created, factory } = crashableFactory();
+    const supervisor = new RuntimeSupervisor({ workerPorts: [13439, 13440], factory, recoverDelayMs: 5 });
+    await supervisor.start();
+    const second = await supervisor.reload();
+    created[0]!.crash();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(supervisor.active).toBe(second);
+    expect(created).toHaveLength(2);
+    await supervisor.shutdown();
+  });
+
+  test('shutdown stops every worker and suppresses recovery', async () => {
+    const { created, factory } = crashableFactory();
+    const supervisor = new RuntimeSupervisor({ workerPorts: [13439, 13440], factory, recoverDelayMs: 5 });
+    const first = await supervisor.start();
+    await supervisor.shutdown();
+    expect(created[0]!.stopped).toBe(true);
+    created[0]!.crash();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(supervisor.active).toBe(first);
+    expect(created).toHaveLength(1);
+  });
+
+  test('a failing stop does not leave the old runtime stuck in the draining set', async () => {
+    const { created, factory } = crashableFactory();
+    const supervisor = new RuntimeSupervisor({
+      workerPorts: [13439, 13440],
+      factory: async (port, generation) => {
+        const runtime = await factory(port, generation);
+        runtime.stop = async () => { throw new Error('stop failed'); };
+        return runtime;
+      },
+      drainTimeoutMs: 50,
+    });
+    await supervisor.start();
+    await supervisor.reload();
+    await waitFor(() => supervisor.draining.size === 0, 2000);
+    expect(created).toHaveLength(2);
+    await supervisor.shutdown();
+  });
 });
