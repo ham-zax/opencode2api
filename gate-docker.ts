@@ -1863,6 +1863,77 @@ function pruneGloballyUnusableSlots(pool: KeySlotPool): number {
   return removed;
 }
 
+const keyPoolTopups = new Map<string, Promise<number>>();
+
+async function topUpKeySlotPool(pool: KeySlotPool, model?: string): Promise<number> {
+  const pending = keyPoolTopups.get(pool.keyId);
+  if (pending) return pending;
+
+  const work = (async () => {
+    if (keySlotPools.get(pool.keyId) !== pool) return 0;
+    pruneGloballyUnusableSlots(pool);
+    let added = 0;
+
+    while (pool.slots.length < SLOTS_PER_KEY) {
+      const attached = new Set(pool.slots.map(slot => slot.addr));
+      const gradeOrder: Record<string, number> = { S: 0, A: 1, B: 2, C: 3 };
+      const available = candidates
+        .filter(c => !c.lockedBy && !attached.has(c.address) && isValidated(c.address) && isExitUsable(c.address, model))
+        .sort((a, b) => {
+          const ga = gradeOrder[a.quality_grade] ?? 99;
+          const gb = gradeOrder[b.quality_grade] ?? 99;
+          if (ga !== gb) return ga - gb;
+          return (a.latency || 9999) - (b.latency || 9999);
+        });
+
+      if (available.length === 0) break;
+
+      let winner: { cand: CandidateItem; latencyMs: number } | null = null;
+      const limit = Math.min(available.length, 12);
+      for (let i = 0; i < limit && !winner; i += 6) {
+        const batch = available.slice(i, i + 6);
+        const results = await Promise.all(batch.map(async cand => ({ cand, ...(await probe(cand)) })));
+        for (const result of results) {
+          if (!result.ok) {
+            if (candidates.includes(result.cand) && !result.cand.lockedBy) recordCandidateFailure(result.cand);
+            continue;
+          }
+          if (!candidates.includes(result.cand) || result.cand.lockedBy || !isExitUsable(result.cand.address, model)) continue;
+          winner = { cand: result.cand, latencyMs: result.latencyMs || result.cand.latency || 0 };
+          break;
+        }
+      }
+
+      if (!winner) break;
+      if (keySlotPools.get(pool.keyId) !== pool) return added;
+
+      const cand = winner.cand;
+      const url = cand.protocol === 'socks5' ? `socks5h://${cand.address}` : `http://${cand.address}`;
+      pool.slots.push({
+        addr: cand.address,
+        url,
+        proto: cand.protocol as 'http' | 'socks5',
+        latencyMs: winner.latencyMs,
+        qualityGrade: gradeFromLatency(winner.latencyMs),
+      });
+      cand.lockedBy = pool.keyId;
+      cand.failCount = 0;
+      markValidated(cand.address);
+      added++;
+      console.log(`[Allocate+] ${cand.address} (${winner.latencyMs}ms) → Key ${pool.keyId.slice(0, 7)}... top-up ${pool.slots.length}/${SLOTS_PER_KEY}`);
+    }
+
+    return added;
+  })();
+
+  keyPoolTopups.set(pool.keyId, work);
+  try {
+    return await work;
+  } finally {
+    if (keyPoolTopups.get(pool.keyId) === work) keyPoolTopups.delete(pool.keyId);
+  }
+}
+
 async function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): Promise<void> {
   if (keySlotPools.get(pool.keyId) !== pool) return;
   const idx = pool.slots.findIndex(s => s.addr === failedAddr);
@@ -2455,20 +2526,31 @@ async function dispatch(
   }
 
   if (!selectedSlot) {
-    // Recovery must be based on usable capacity, not raw slot count. A 429'd
-    // exit remains in the slot array during cooldown; treating that as a
-    // non-empty pool made requests skip replacement and fall straight through
-    // to the direct egress cooldown despite validated free exits being ready.
+    // Recovery must be based on usable capacity, not raw slot count. A partial
+    // pool can retain one globally healthy slot that is banned for this model;
+    // getKeySlotPool() would return it unchanged and skip the validated free
+    // exits. Top up the current pool against the requested model first.
     pruneGloballyUnusableSlots(pool);
-    console.log(`[Dispatch] No usable slot for Key ${pool.keyId.slice(0, 7)}..., attempting recovery refill`);
-    const refilled = await getKeySlotPool(pool.keyId);
-    if (refilled && refilled.slots.length > 0) {
-      pool = refilled;
-      for (const slot of pool.slots) {
-        if (triedAddrs.has(slot.addr)) continue;
-        if (!isExitUsable(slot.addr, dispatchModel)) continue;
-        selectedSlot = slot;
-        break;
+    console.log(`[Dispatch] No usable slot for Key ${pool.keyId.slice(0, 7)}..., attempting validated top-up`);
+    await topUpKeySlotPool(pool, dispatchModel);
+    for (const slot of pool.slots) {
+      if (triedAddrs.has(slot.addr)) continue;
+      if (!isExitUsable(slot.addr, dispatchModel)) continue;
+      selectedSlot = slot;
+      break;
+    }
+
+    if (!selectedSlot && pool.slots.length === 0) {
+      console.log(`[Dispatch] Key ${pool.keyId.slice(0, 7)}... still empty, attempting full re-allocation`);
+      const refilled = await getKeySlotPool(pool.keyId);
+      if (refilled && refilled.slots.length > 0) {
+        pool = refilled;
+        for (const slot of pool.slots) {
+          if (triedAddrs.has(slot.addr)) continue;
+          if (!isExitUsable(slot.addr, dispatchModel)) continue;
+          selectedSlot = slot;
+          break;
+        }
       }
     }
   }

@@ -71,7 +71,7 @@ function fixture(probeTimeout = 2500) {
   });
   const gateway: any = vm.runInContext(definitions + `
     ({ coarseScreen, probe, backgroundProbeSweep, allocateKeySlots, loadCandidates,
-       replaceFailedSlot, getKeySlotPool, releaseKeySlots, pruneGloballyUnusableSlots,
+       replaceFailedSlot, getKeySlotPool, releaseKeySlots, pruneGloballyUnusableSlots, topUpKeySlotPool,
        freeExitCount, currentDemandKeyCount, operationalPoolTarget, currentPoolState, poolGenerationConcurrencyCap, waitForPoolGenerationCapacity, markValidated, noteExitFailure,
        isExitUsable, validatedExits, exitHealth, exitModelBans, keySlotPools, coarseSeen,
        saveProxyHealthState, loadProxyHealthState,
@@ -388,6 +388,29 @@ describe('proxy pool regression checks', () => {
     await g.replaceFailedSlot(pool, items[0].address);
     expect(probed).toEqual([items[3].address]);
     expect(pool.slots.map(s => s.addr)).toEqual([items[3].address]);
+  });
+
+  test('partial pools top up from validated free exits before direct fallback', async () => {
+    const g = fixture();
+    const attached = candidate(41, 'key-a');
+    const spare1 = candidate(42, null);
+    const spare2 = candidate(43, null);
+    g.setCandidates([attached, spare1, spare2]);
+    const pool = {
+      keyId: 'key-a', rrCursor: 0, lastUsedAt: g.now,
+      slots: [{ addr: attached.address, url: `http://${attached.address}`, proto: 'http', latencyMs: 100, qualityGrade: 'B' }],
+    };
+    g.keySlotPools.set('key-a', pool);
+    g.markValidated(spare1.address);
+    g.markValidated(spare2.address);
+    g.setProbe(async () => ({ ok: true, latencyMs: 100 }));
+
+    const added = await g.topUpKeySlotPool(pool, 'muse-spark-1.3-contributor-free');
+    expect(added).toBe(2);
+    expect(pool.slots).toHaveLength(3);
+    expect(new Set(pool.slots.map((slot: any) => slot.addr)).size).toBe(3);
+    expect(spare1.lockedBy).toBe('key-a');
+    expect(spare2.lockedBy).toBe('key-a');
   });
 
   test('cooled attached slots are pruned and replaced before direct fallback', async () => {
