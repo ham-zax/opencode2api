@@ -1436,9 +1436,17 @@ async function probeWarp(): Promise<boolean> {
 //  ZenProxy Relay Fallback Channel
 // ═══════════════════════════════════════════════════════════
 
+interface DispatchResult {
+  status: number;
+  body?: string;
+  stream?: ReadableStream<Uint8Array>;
+  streamHeaders?: Record<string, string>;
+  responseHeaders?: Record<string, string>;
+}
+
 async function proxyViaRelay(
   path: string, method: string, headers: Record<string, string>, body: string | undefined,
-): Promise<{ status: number; body?: string; stream?: ReadableStream<Uint8Array>; streamHeaders?: Record<string, string> }> {
+): Promise<DispatchResult> {
   const relayUrl = ZENPROXY_RELAY + path;
   const relayHeaders: Record<string, string> = { ...headers, 'x-zenproxy-key': ZENPROXY_KEY };
   try {
@@ -1449,7 +1457,7 @@ async function proxyViaRelay(
       signal: AbortSignal.timeout(60000),
     });
     const bodyText = await res.text();
-    return { status: res.status, body: bodyText };
+    return { status: res.status, body: bodyText, responseHeaders: Object.fromEntries(res.headers.entries()) };
   } catch (e: any) {
     console.error(`[ZenProxy] relay failed: ${e.message}`);
     return { status: 502, body: JSON.stringify({ error: 'relay_failed', message: e.message }) };
@@ -2074,7 +2082,7 @@ function extractUsageFromResponse(respBody: string): { tokens: number; model: st
 async function dispatchDirect(
   path: string, method: string, headers: Record<string, string>,
   body: string | undefined, pool: KeySlotPool,
-): Promise<{ status: number; body?: string; stream?: ReadableStream<Uint8Array>; streamHeaders?: Record<string, string> }> {
+): Promise<DispatchResult> {
   console.log(`[Dispatch] fallback → Direct connection`);
   const start = Date.now();
   try {
@@ -2100,9 +2108,9 @@ async function dispatchDirect(
       } catch {}
       if (directErr) {
         console.warn(`[Dispatch] Direct fallback response: ${directErr.slice(0, 150)}`);
-        return { status: result.status, body: directErr };
+        return { status: result.status, body: directErr, responseHeaders: result.headers };
       }
-      return { status: result.status, body: `{"error":{"message":"Upstream error (${result.status})"}}` };
+      return { status: result.status, body: `{"error":{"message":"Upstream error (${result.status})"}}`, responseHeaders: result.headers };
     }
     const result = await doHttps(path, method, headers, body, undefined);
     const latencyMs = Date.now() - start;
@@ -2113,7 +2121,7 @@ async function dispatchDirect(
     }
     stats.total++; stats.errors++;
     audit(result.status, latencyMs, 'direct', path, result.body, pool.keyId);
-    return { status: result.status, body: result.body };
+    return { status: result.status, body: result.body, responseHeaders: result.headers };
   } catch (e: any) {
     stats.total++; stats.errors++;
     audit(502, Date.now() - start, 'direct', path, JSON.stringify({ error: e.message }), pool.keyId);
@@ -2125,7 +2133,7 @@ async function dispatch(
   path: string, method: string, headers: Record<string, string>,
   body: string | undefined, pool: KeySlotPool,
   retry = 0, triedAddrs = new Set<string>(),
-): Promise<{ status: number; body?: string; stream?: ReadableStream<Uint8Array>; streamHeaders?: Record<string, string> }> {
+): Promise<DispatchResult> {
 
   // The requested model, used to scope per-(exit x model) bans so a 403 on one
   // model does not evict an exit that is healthy for everything else.
@@ -2256,7 +2264,8 @@ async function dispatch(
       console.log(`[Dispatch] All proxy retries exhausted for ${path}, attempting direct fallback...`);
       const directRes = await dispatchDirect(path, method, headers, body, pool);
       if (directRes.status >= 200 && directRes.status < 400) return directRes;
-      return { status: result.status, body: errBody };
+      if (directRes.status === 429 || directRes.status === 503) return directRes;
+      return { status: result.status, body: errBody, responseHeaders: result.headers };
     } else {
       const result = await doHttps(path, method, headers, body, agent);
       const latencyMs = Date.now() - start;
@@ -2294,7 +2303,8 @@ async function dispatch(
       console.log(`[Dispatch] All proxy retries exhausted for ${path}, attempting direct fallback...`);
       const directRes = await dispatchDirect(path, method, headers, body, pool);
       if (directRes.status >= 200 && directRes.status < 400) return directRes;
-      return { status: result.status, body: result.body };
+      if (directRes.status === 429 || directRes.status === 503) return directRes;
+      return { status: result.status, body: result.body, responseHeaders: result.headers };
     }
   } catch (e: any) {
     stats.total++;
@@ -2310,6 +2320,7 @@ async function dispatch(
     console.log(`[Dispatch] All proxy attempts failed with exception, attempting direct fallback...`);
     const directRes = await dispatchDirect(path, method, headers, body, pool);
     if (directRes.status >= 200 && directRes.status < 400) return directRes;
+    if (directRes.status === 429 || directRes.status === 503) return directRes;
     return { status: 502, body: JSON.stringify({ error: 'proxy_error', message: e.message }) };
   } finally {
     if (!isStreamHandedOff) {
@@ -2439,6 +2450,13 @@ function readBody(nodeReq: http.IncomingMessage): Promise<string> {
     nodeReq.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
     nodeReq.on('error', reject);
   });
+}
+
+function retryResponseHeaders(status: number, upstream: Record<string, string> | undefined): Record<string, string> {
+  if (status !== 429 && status !== 503) return {};
+  const raw = upstream?.['retry-after'] || upstream?.['Retry-After'];
+  if (raw && String(raw).trim()) return { 'retry-after': String(raw).trim() };
+  return { 'retry-after': String(Math.ceil(EXIT_COOLDOWN_BASE_MS / 1000)) };
 }
 
 function sendJson(nodeRes: http.ServerResponse, status: number, data: any) {
@@ -4068,6 +4086,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
         nodeRes.writeHead(result.status, {
           'content-type': 'application/json',
           'access-control-allow-origin': '*',
+          ...retryResponseHeaders(result.status, result.responseHeaders),
           ...(substitutedTo
             ? { 'x-opencode2api-substituted-model': `${substitutedFrom} -> ${substitutedTo}` }
             : {}),

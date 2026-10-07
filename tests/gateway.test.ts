@@ -382,6 +382,22 @@ describe('HTTP compatibility', () => {
     });
   });
 
+  test('final 429 and 503 responses carry retry guidance', async () => {
+    await withServer(async (base, g) => {
+      g.setDispatch(async () => ({ status: 429, body: '{"error":"rate_limited"}', responseHeaders: { 'retry-after': '17' } }));
+      let response = await fetch(base + '/v1/chat/completions', { method: 'POST', headers, body: completion(false) });
+      expect(response.status).toBe(429);
+      expect(response.headers.get('retry-after')).toBe('17');
+      await response.text();
+
+      g.setDispatch(async () => ({ status: 503, body: '{"error":"unavailable"}' }));
+      response = await fetch(base + '/v1/chat/completions', { method: 'POST', headers, body: completion(false) });
+      expect(response.status).toBe(503);
+      expect(response.headers.get('retry-after')).toBe('30');
+      await response.text();
+    });
+  });
+
   test('non-stream clients receive assembled JSON and usage is counted once', async () => {
     await withServer(async (base, g) => {
       g.setDispatch(async () => ({ status: 200, stream: replyStream() }));
