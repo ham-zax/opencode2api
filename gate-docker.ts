@@ -1203,14 +1203,15 @@ async function measureProxy(item: ProxyItem): Promise<{ ok: boolean; latencyMs: 
 type PoolState = 'healthy' | 'watch' | 'constrained' | 'degraded';
 
 // Free (unlocked) exits needed to serve every key without contention.
-const POOL_TARGET = Math.max(60, SLOTS_PER_KEY * MAX_ACTIVE_KEYS * 2);
+const POOL_CAPACITY_TARGET = Math.max(60, SLOTS_PER_KEY * MAX_ACTIVE_KEYS * 2);
+const POOL_MIN_OPERATIONAL_TARGET = Math.max(SLOTS_PER_KEY * 2, parseInt(process.env.POOL_MIN_OPERATIONAL_TARGET || '12'));
 const POOL_BACKPRESSURE_WAIT_MS = parseInt(process.env.POOL_BACKPRESSURE_WAIT_MS || '30000');
 const POOL_BACKPRESSURE_POLL_MS = Math.max(25, parseInt(process.env.POOL_BACKPRESSURE_POLL_MS || '100'));
-const POOL_TIERS: Record<PoolState, { min: number; admitMs: number; scrapeAll: boolean }> = {
-  healthy:   { min: POOL_TARGET,      admitMs: 1200, scrapeAll: false },
-  watch:      { min: Math.round(POOL_TARGET * 0.4), admitMs: 2000, scrapeAll: false },
-  constrained:{ min: Math.round(POOL_TARGET * 0.15), admitMs: 3500, scrapeAll: true },
-  degraded:   { min: 0,               admitMs: 0,    scrapeAll: true },
+const POOL_TIERS: Record<PoolState, { admitMs: number; scrapeAll: boolean }> = {
+  healthy:     { admitMs: 1200, scrapeAll: false },
+  watch:       { admitMs: 2000, scrapeAll: false },
+  constrained: { admitMs: 3500, scrapeAll: true },
+  degraded:    { admitMs: 0,    scrapeAll: true },
 };
 
 // Only exits that have actually answered a coarse screen count towards pool
@@ -1240,11 +1241,21 @@ function freeExitCount(): number {
   return exits.size;
 }
 
+function currentDemandKeyCount(): number {
+  const active = Object.values(activeRequests).filter(n => n > 0).length;
+  return Math.max(1, keySlotPools.size, active);
+}
+
+function operationalPoolTarget(): number {
+  return Math.max(POOL_MIN_OPERATIONAL_TARGET, SLOTS_PER_KEY * currentDemandKeyCount() * 2);
+}
+
 function currentPoolState(): PoolState {
   const free = freeExitCount();
-  if (free >= POOL_TIERS.healthy.min) return 'healthy';
-  if (free >= POOL_TIERS.watch.min) return 'watch';
-  if (free >= POOL_TIERS.constrained.min) return 'constrained';
+  const target = operationalPoolTarget();
+  if (free >= target) return 'healthy';
+  if (free >= Math.max(1, Math.round(target * 0.4))) return 'watch';
+  if (free >= Math.max(1, Math.round(target * 0.15))) return 'constrained';
   return 'degraded';
 }
 
@@ -3461,7 +3472,9 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       pool: {
         state: currentPoolState(),
         freeExits: freeExitCount(),
-        target: POOL_TARGET,
+        target: operationalPoolTarget(),
+        capacityTarget: POOL_CAPACITY_TARGET,
+        demandKeys: currentDemandKeyCount(),
         backpressureWaitMs: POOL_BACKPRESSURE_WAIT_MS,
         admitCeilingMs: admissionCeilingMs(),
         validatedTotal: validatedExits.size,

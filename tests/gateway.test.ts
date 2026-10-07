@@ -72,7 +72,7 @@ function fixture(probeTimeout = 2500) {
   const gateway: any = vm.runInContext(definitions + `
     ({ coarseScreen, probe, backgroundProbeSweep, allocateKeySlots, loadCandidates,
        replaceFailedSlot, getKeySlotPool, releaseKeySlots,
-       freeExitCount, currentPoolState, poolGenerationConcurrencyCap, waitForPoolGenerationCapacity, markValidated, noteExitFailure,
+       freeExitCount, currentDemandKeyCount, operationalPoolTarget, currentPoolState, poolGenerationConcurrencyCap, waitForPoolGenerationCapacity, markValidated, noteExitFailure,
        isExitUsable, validatedExits, exitHealth, keySlotPools, coarseSeen,
        setCandidates(value) { candidates = value; },
        getCandidates() { return candidates; },
@@ -130,6 +130,16 @@ describe('proxy pool regression checks', () => {
     expect(g.currentPoolState()).toBe('degraded');
     g.advance(15 * 60_000 + 1);
     expect(g.freeExitCount()).toBe(0);
+  });
+
+  test('pool state is based on current workload, not 20-key reserve capacity', () => {
+    const g = fixture();
+    const items = Array.from({ length: 12 }, (_, i) => candidate(i + 1));
+    g.setCandidates(items);
+    for (const c of items) g.markValidated(c.address);
+    expect(g.currentDemandKeyCount()).toBe(1);
+    expect(g.operationalPoolTarget()).toBe(12);
+    expect(g.currentPoolState()).toBe('healthy');
   });
 
   test('generation concurrency cap tightens as pool capacity falls', () => {
