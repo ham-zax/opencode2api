@@ -167,6 +167,7 @@ Notes:
 - If the active worker crashes, the supervisor starts a replacement automatically; `SIGTERM`/`SIGINT` stops all workers.
 - Key usage counters (`totalRequests`, `requestCount`, `totalTokens`, `lastUsedAt`) are merged additively into `keys.json`, so usage from both generations during an overlap is kept. The merge is read-modify-write, so a very small race window remains between processes.
 - Per-key `maxConcurrency` is enforced separately by each generation, so during a reload overlap a key may briefly exceed its limit.
+- Avoid key admin changes (create/update/delete) while a reload is in progress: the replacement worker loaded `keys.json` when it started, and it overwrites non-counter edits made through the old worker during that window.
 
 ---
 

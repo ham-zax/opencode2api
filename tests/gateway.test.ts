@@ -1363,6 +1363,37 @@ describe('stream admission and exit routing', () => {
     expect(probes).toBe(afterFirst);
   });
 
+  test('a model-specific top-up does not settle for a concurrent generic one', async () => {
+    const g = fixture();
+    const items = Array.from({ length: 12 }, (_, i) => candidate(i + 1, i < 2 ? 'key' : null));
+    items[2].latency = 1;
+    const p = pool(items[0].address, items[1].address);
+    g.setCandidates(items);
+    g.keySlotPools.set('key', p);
+    for (const c of items) g.markValidated(c.address);
+    for (const c of items.slice(0, 3)) g.exitModelBans.set(c.address, new Map([['m', { fails: 3, bannedUntil: g.now + 600_000 }]]));
+    g.setProbe(healthy);
+    const generic = g.topUpKeySlotPool(p);
+    const forModel = g.topUpKeySlotPool(p, 'm');
+    await Promise.all([generic, forModel]);
+    expect(p.slots.some((slot: any) => g.isExitUsable(slot.addr, 'm'))).toBe(true);
+  });
+
+  test('a top-up with no deficit does not arm the empty backoff', async () => {
+    const g = fixture();
+    const items = Array.from({ length: 6 }, (_, i) => candidate(i + 1, i < 3 ? 'key' : null));
+    const p = pool(...items.slice(0, 3).map(c => c.address));
+    g.setCandidates(items);
+    g.keySlotPools.set('key', p);
+    for (const c of items) g.markValidated(c.address);
+    g.setProbe(healthy);
+    expect(await g.topUpKeySlotPool(p)).toBe(0);
+    g.activeRequests.key = 5;
+    await g.getKeySlotPool('key');
+    for (let i = 0; i < 50 && p.slots.length < 5; i++) await new Promise(resolve => setTimeout(resolve, 2));
+    expect(p.slots).toHaveLength(5);
+  });
+
   test('a fresh pool grows when parallel demand arrives during its initial allocation', async () => {
     const g = fixture();
     const items = Array.from({ length: 18 }, (_, i) => candidate(i + 1));

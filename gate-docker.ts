@@ -1896,7 +1896,7 @@ function pruneGloballyUnusableSlots(pool: KeySlotPool): number {
   return removed;
 }
 
-const keyPoolTopups = new Map<string, { pool: KeySlotPool; work: Promise<number> }>();
+const keyPoolTopups = new Map<string, { pool: KeySlotPool; model?: string; work: Promise<number> }>();
 // A top-up that found nothing must not be retried by every incoming request.
 const TOPUP_EMPTY_BACKOFF_MS = 5000;
 const keyTopUpBackoffUntil = new Map<string, number>();
@@ -1914,7 +1914,13 @@ function desiredProxySlots(key: string): number {
 
 async function topUpKeySlotPool(pool: KeySlotPool, model?: string): Promise<number> {
   const pending = keyPoolTopups.get(pool.keyId);
-  if (pending?.pool === pool) return pending.work;
+  if (pending?.pool === pool) {
+    if (pending.model === model) return pending.work;
+    // A generic background top-up does not count exits banned for this model;
+    // let it finish, then top up again against the requested model.
+    await pending.work.catch(() => 0);
+    return topUpKeySlotPool(pool, model);
+  }
   const work = (async () => {
     if (keySlotPools.get(pool.keyId) !== pool) return 0;
     pruneGloballyUnusableSlots(pool);
@@ -1951,10 +1957,10 @@ async function topUpKeySlotPool(pool: KeySlotPool, model?: string): Promise<numb
       }
     }
     if (added > 0) keyTopUpBackoffUntil.delete(pool.keyId);
-    else keyTopUpBackoffUntil.set(pool.keyId, Date.now() + TOPUP_EMPTY_BACKOFF_MS);
+    else if (model === undefined && pool.slots.length < target()) keyTopUpBackoffUntil.set(pool.keyId, Date.now() + TOPUP_EMPTY_BACKOFF_MS);
     return added;
   })();
-  keyPoolTopups.set(pool.keyId, { pool, work });
+  keyPoolTopups.set(pool.keyId, { pool, model, work });
   try { return await work; }
   finally { if (keyPoolTopups.get(pool.keyId)?.work === work) keyPoolTopups.delete(pool.keyId); }
 }

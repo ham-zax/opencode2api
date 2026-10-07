@@ -35,7 +35,8 @@ function sleep(ms: number): Promise<void> {
 function isLoopbackRequest(req: http.IncomingMessage): boolean {
   const address = req.socket.remoteAddress;
   const local = address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
-  return local && !req.headers['x-forwarded-for'];
+  const forwarded = ['x-forwarded-for', 'x-real-ip', 'forwarded', 'cf-connecting-ip'].some(name => req.headers[name]);
+  return local && !forwarded;
 }
 
 export function chooseStandbyPort(activePort: number | null, ports: number[], unavailable: Iterable<number> = []): number {
