@@ -475,14 +475,15 @@ function shapeAgentRequest(
   // agent tools. Clients such as Pi send their own partial tool surface; keeping
   // that surface while appending only the missing core names preserves client
   // functionality and keeps the anonymous Zen request recognisably agent-shaped.
-  const declared: string[] = Array.isArray(parsed.tools)
+  const callerHasTools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
+  const declared: string[] = callerHasTools
     ? parsed.tools.map((t: any) => String(t?.function?.name || t?.name || '')).filter(Boolean)
     : [];
-  const missing = FREE_TIER_CORE_TOOLS.filter(name => !declared.includes(name));
+  const missing = callerHasTools ? FREE_TIER_CORE_TOOLS.filter(name => !declared.includes(name)) : [];
   if (missing.length) {
     const tools = freeTierStubToolset(missing).map(t => endpoint === 'responses'
       ? { type: 'function', ...t.function } : t);
-    parsed.tools = Array.isArray(parsed.tools) ? [...parsed.tools, ...tools] : tools;
+    parsed.tools = [...parsed.tools, ...tools];
     changed = true;
   }
 
@@ -2695,7 +2696,6 @@ function chatBodyToResponses(bodyStr: string): string | null {
         : t
     ));
   }
-  if (!out.tools || !out.tools.length) out.tools = freeTierStubToolset(FREE_TIER_CORE_TOOLS);
   if (src.tool_choice) out.tool_choice = src.tool_choice?.function
     ? { type: 'function', name: src.tool_choice.function.name } : src.tool_choice;
   if (src.reasoning_effort) out.reasoning = { effort: src.reasoning_effort };

@@ -85,7 +85,7 @@ function fixture(probeTimeout = 2500) {
        getKeys() { return apiKeys; },
        setModels(value) { cachedModels = value; cachedModelsTime = Date.now(); },
        activeRequests, fetchModelsFromUpstream, ensureModelCatalog, loadModelCatalog,
-       normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, collectHeadersFromReq,
+       normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, chatBodyToResponses, collectHeadersFromReq,
        monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect, sendJson,
        probeFreeModel, verifyFreeModels, freeModelHealth, workingFreeModelIds, hasModelOutput,
        catalogStatus,
@@ -567,7 +567,7 @@ describe('HTTP compatibility', () => {
         const doc = JSON.parse(body);
         expect(doc.model).toBe('muse-spark-9-contributor-free');
         expect(doc.input[0].content).toBe('Hi');
-        expect(doc.tools.every((t: any) => !t.function && t.name)).toBe(true);
+        expect(doc.tools).toBeUndefined();
         return { status: 200, stream: responsesStream() };
       });
       const response = await fetch(base + '/v1/chat/completions', { method: 'POST', headers,
@@ -819,6 +819,18 @@ describe('Zen discovery and health', () => {
     const g = fixture(); g.hang();
     const pending = g.probeFreeModel('big-pickle'); g.fireTimers(20000);
     expect((await pending).status).toBe(0);
+  });
+
+  test('tool-free callers stay tool-free while still receiving free-tier stream shaping', () => {
+    const g = fixture();
+    const chat = g.shapeAgentRequest(JSON.stringify({ model: 'space-bunny-free', messages: [{ role: 'user', content: 'write a long text' }] }), 'chat');
+    const shaped = JSON.parse(chat.body);
+    expect(shaped.stream).toBe(true);
+    expect(shaped.tools).toBeUndefined();
+
+    const responses = JSON.parse(g.chatBodyToResponses(JSON.stringify({ model: 'muse-spark-1.3-contributor-free', messages: [{ role: 'user', content: 'hello' }] }))!);
+    expect(responses.stream).toBe(true);
+    expect(responses.tools).toBeUndefined();
   });
 
   test('agent shaping preserves client tools and appends missing core tools', () => {
