@@ -432,7 +432,7 @@ function freeTierStubToolset(names: string[]): any[] {
     type: 'function',
     function: {
       name,
-      description: `${name} tool`,
+      description: `Internal compatibility marker for ${name}; do not call this tool. Answer the user directly without tools.`,
       parameters: { type: 'object', properties: {}, required: [] },
     },
   }));
@@ -475,12 +475,18 @@ function shapeAgentRequest(
   // agent tools. Clients such as Pi send their own partial tool surface; keeping
   // that surface while appending only the missing core names preserves client
   // functionality and keeps the anonymous Zen request recognisably agent-shaped.
-  const callerHasTools = Array.isArray(parsed.tools) && parsed.tools.length > 0;
-  const declared: string[] = callerHasTools
+  const callerHasTools = requestDeclaresTools(bodyStr);
+  const declared: string[] = Array.isArray(parsed.tools)
     ? parsed.tools.map((t: any) => String(t?.function?.name || t?.name || '')).filter(Boolean)
     : [];
-  if (!callerHasTools && (parsed.tool_choice == null || parsed.tool_choice === 'auto')) {
-    parsed.tool_choice = 'none';
+  if (!callerHasTools) {
+    const instruction = 'Answer directly. Do not call tools. Any tools present in this request are internal compatibility markers only.';
+    if (endpoint === 'chat') {
+      const messages = Array.isArray(parsed.messages) ? parsed.messages : [];
+      parsed.messages = [{ role: 'system', content: instruction }, ...messages];
+    } else {
+      parsed.instructions = parsed.instructions ? `${parsed.instructions}\n\n${instruction}` : instruction;
+    }
     changed = true;
   }
   const missing = FREE_TIER_CORE_TOOLS.filter(name => !declared.includes(name));
@@ -493,6 +499,63 @@ function shapeAgentRequest(
 
   if (!changed) return { body: bodyStr, callerWantsStream, reshaped: false };
   return { body: JSON.stringify(parsed), callerWantsStream, reshaped: true };
+}
+
+function requestDeclaresTools(bodyStr: string | undefined): boolean {
+  if (!bodyStr) return false;
+  try {
+    const parsed = JSON.parse(bodyStr);
+    if (Array.isArray(parsed?.tools) && parsed.tools.length > 0) return true;
+    if (parsed?.tool_choice != null) return true;
+    if (Array.isArray(parsed?.messages) && parsed.messages.some((m: any) => m?.role === 'tool' || (Array.isArray(m?.tool_calls) && m.tool_calls.length > 0))) return true;
+    if (Array.isArray(parsed?.input) && parsed.input.some((item: any) => item?.type === 'function_call' || item?.type === 'function_call_output')) return true;
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+function guardToolFreeStream(stream: ReadableStream<Uint8Array>, mode: 'chat' | 'responses'): ReadableStream<Uint8Array> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  const inspectLine = (line: string) => {
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    let evt: any;
+    try { evt = JSON.parse(data); } catch { return; }
+    const syntheticCall = mode === 'responses'
+      ? (evt?.type === 'response.output_item.added' && evt?.item?.type === 'function_call')
+        || evt?.type === 'response.function_call_arguments.delta'
+        || evt?.type === 'response.function_call_arguments.done'
+      : Array.isArray(evt?.choices) && evt.choices.some((choice: any) => Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0);
+    if (syntheticCall) throw new Error('Upstream attempted a synthetic tool call for a tool-free client');
+  };
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split(/\r?\n/);
+            buffer = lines.pop() || '';
+            for (const line of lines) inspectLine(line);
+            controller.enqueue(value);
+          }
+        }
+        if (buffer) inspectLine(buffer);
+        controller.close();
+      } catch (e: any) {
+        try { controller.error(e instanceof Error ? e : new Error(String(e))); } catch {}
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  });
 }
 
 function isTransientStatus(status: number): boolean {
@@ -3931,6 +3994,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
     }
     let substitutedFrom: string | undefined;
     let substitutedTo: string | undefined;
+    let callerDeclaredTools = false;
     // Whether the caller asked for SSE. The agent shape forces stream:true
     // upstream, so a non-streaming caller is served by reassembling the SSE
     // back into a single JSON completion rather than being handed a stream.
@@ -3942,6 +4006,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
         return;
       }
       bodyStr = normalized.body;
+      callerDeclaredTools = requestDeclaresTools(bodyStr);
       if (upstreamPath === '/v1/responses' && !isResponsesOnlyModel(JSON.parse(bodyStr!).model)) {
         sendJson(nodeRes, 400, { error: 'unsupported_transport', message: 'This model uses /v1/chat/completions' });
         return;
@@ -4046,6 +4111,10 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       if (usedResponses && result.stream) {
         result.stream = responsesSseToChatSse(result.stream, responsesFallbackModel);
         result.streamHeaders = { ...(result.streamHeaders || {}), 'content-type': 'text/event-stream; charset=utf-8' };
+      }
+      if (result.stream && !callerDeclaredTools) {
+        const clientMode: 'chat' | 'responses' = upstreamPath === '/v1/responses' && !usedResponses ? 'responses' : 'chat';
+        result.stream = guardToolFreeStream(result.stream, clientMode);
       }
 
       if (result.stream) {

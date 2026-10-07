@@ -86,7 +86,7 @@ function fixture(probeTimeout = 2500) {
        setModels(value) { cachedModels = value; cachedModelsTime = Date.now(); },
        activeRequests, fetchModelsFromUpstream, ensureModelCatalog, loadModelCatalog,
        normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, chatBodyToResponses, collectHeadersFromReq,
-       monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect, sendJson,
+       requestDeclaresTools, guardToolFreeStream, monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect, sendJson,
        probeFreeModel, verifyFreeModels, freeModelHealth, workingFreeModelIds, hasModelOutput,
        catalogStatus,
        setFetcher(value) { fetchJsonDirect = value; },
@@ -586,9 +586,11 @@ describe('HTTP compatibility', () => {
         expect(path).toBe('/v1/responses');
         const doc = JSON.parse(body);
         expect(doc.model).toBe('muse-spark-9-contributor-free');
-        expect(doc.input[0].content).toBe('Hi');
+        expect(doc.input[0].role).toBe('developer');
+        expect(doc.input[0].content).toContain('Do not call tools');
+        expect(doc.input[1].content).toBe('Hi');
         expect(doc.tools).toHaveLength(5);
-        expect(doc.tool_choice).toBe('none');
+        expect(doc.tool_choice).toBeUndefined();
         return { status: 200, stream: responsesStream() };
       });
       const response = await fetch(base + '/v1/chat/completions', { method: 'POST', headers,
@@ -842,7 +844,7 @@ describe('Zen discovery and health', () => {
     expect((await pending).status).toBe(0);
   });
 
-  test('tool-free callers keep upstream agent stubs but cannot execute them', () => {
+  test('tool-free callers keep inert upstream stubs and explicit no-tool instructions', () => {
     const g = fixture();
     for (const endpoint of ['chat', 'responses'] as const) {
       const shaped = g.shapeAgentRequest(JSON.stringify({
@@ -853,8 +855,22 @@ describe('Zen discovery and health', () => {
       const body = JSON.parse(shaped.body);
       expect(body.stream).toBe(true);
       expect(body.tools.length).toBe(5);
-      expect(body.tool_choice).toBe('none');
+      expect(body.tool_choice).toBeUndefined();
+      expect(body.tools.every((tool: any) => String(tool.description || tool.function?.description || '').includes('do not call'))).toBe(true);
+      if (endpoint === 'chat') expect(body.messages[0].content).toContain('Do not call tools');
+      else expect(body.instructions).toContain('Do not call tools');
     }
+  });
+
+  test('tool-free response guard rejects synthetic tool calls', async () => {
+    const g = fixture();
+    const chat = new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":null}]}\n\n`));
+      controller.close();
+    }});
+    await expect(new Response(g.guardToolFreeStream(chat, 'chat')).text()).rejects.toThrow('synthetic tool call');
+    expect(g.requestDeclaresTools(JSON.stringify({ tools: [] }))).toBe(false);
+    expect(g.requestDeclaresTools(JSON.stringify({ tools: [{ type: 'function', function: { name: 'read' } }] }))).toBe(true);
   });
 
   test('agent shaping preserves client tools and appends missing core tools', () => {
