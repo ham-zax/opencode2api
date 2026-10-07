@@ -449,6 +449,7 @@ describe('HTTP compatibility', () => {
       const response = await fetch(base + '/api/status');
       expect(response.status).toBe(200);
       const doc = await response.json();
+      expect(doc.timeouts.streamFirstByteMs).toBe(30000);
       expect(doc.timeouts.streamIdleMs).toBe(600000);
       expect(doc.timeouts.proxyConnectMs).toBe(15000);
       expect(doc.directEgress.usable).toBe(true);

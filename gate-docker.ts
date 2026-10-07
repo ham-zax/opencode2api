@@ -326,7 +326,8 @@ const UPSTREAM = 'https://opencode.ai/zen';
 const PORT = parseInt(process.env.PORT || '13339');
 const MAX_RETRIES = 3;
 const TIMEOUT = 15000;
-const STREAM_TIMEOUT = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS || '600000');
+const STREAM_FIRST_BYTE_TIMEOUT_MS = parseInt(process.env.STREAM_FIRST_BYTE_TIMEOUT_MS || '30000');
+const STREAM_IDLE_TIMEOUT_MS = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS || '600000');
 const PROXY_CONNECT_TIMEOUT_MS = parseInt(process.env.PROXY_CONNECT_TIMEOUT_MS || '15000');
 
 const MAX_ACTIVE_KEYS = 20;
@@ -1962,7 +1963,7 @@ function doHttpsStream(
       reqHeaders['content-length'] = String(Buffer.byteLength(body, 'utf-8'));
       delete reqHeaders['transfer-encoding'];
     }
-    const opts: any = { method, headers: reqHeaders, timeout: STREAM_TIMEOUT, rejectUnauthorized: false };
+    const opts: any = { method, headers: reqHeaders, timeout: STREAM_FIRST_BYTE_TIMEOUT_MS, rejectUnauthorized: false };
     if (agent) opts.agent = agent;
 
     let cleanedUp = false;
@@ -2020,7 +2021,7 @@ function doHttpsStream(
       });
 
       res.on('data', (chunk: Buffer) => {
-        try { req.setTimeout(STREAM_TIMEOUT); } catch {}
+        try { req.setTimeout(STREAM_IDLE_TIMEOUT_MS); } catch {}
         const u8 = new Uint8Array(chunk);
         if (!firstChunkReceived) {
           firstChunkReceived = true;
@@ -3533,7 +3534,8 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       totalApiKeys: Object.keys(apiKeys).length,
       timeouts: {
         nonStreamMs: TIMEOUT,
-        streamIdleMs: STREAM_TIMEOUT,
+        streamFirstByteMs: STREAM_FIRST_BYTE_TIMEOUT_MS,
+        streamIdleMs: STREAM_IDLE_TIMEOUT_MS,
         proxyConnectMs: PROXY_CONNECT_TIMEOUT_MS,
         proxyProbeMs: PROXY_PROBE_TIMEOUT,
       },

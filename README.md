@@ -297,6 +297,7 @@ OpenCode2API can be configured via environment variables in `docker-compose.yml`
 | `WARP_SOCKS5_PORT`| `1080` | Port of WARP SOCKS5 service. |
 | `PROXY_REFRESH_MS`| `300000` | Interval (ms) for refreshing candidate proxy pools (5 min). |
 | `PROXY_CONNECT_TIMEOUT_MS` | `15000` | Timeout (ms) for establishing a proxy connection; kept separate from generation lifetime. |
+| `STREAM_FIRST_BYTE_TIMEOUT_MS` | `30000` | Maximum wait (ms) for the first upstream SSE bytes before the attempt is treated as stalled and can fail over. |
 | `STREAM_IDLE_TIMEOUT_MS` | `600000` | Upstream SSE inactivity timeout (ms). Each received chunk refreshes the idle timer; this is not a total generation deadline. |
 | `CLASH_SUBSCRIBE_URLS`| *(FreeSub YAML)* | Comma-separated Clash/Mihomo subscription URLs. |
 | `PROXY_POOL_URL` | `""` | Optional external proxy pool API endpoint. |
