@@ -54,6 +54,7 @@ function fixture(probeTimeout = 2500) {
         requests++;
         const req = new EventEmitter() as any;
         req.destroy = () => {};
+        req.write = () => true;
         req.end = () => queueMicrotask(() => {
           if (hang) return;
           now += latency;
@@ -84,7 +85,7 @@ function fixture(probeTimeout = 2500) {
        setModels(value) { cachedModels = value; cachedModelsTime = Date.now(); },
        activeRequests, fetchModelsFromUpstream, ensureModelCatalog, loadModelCatalog,
        normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, collectHeadersFromReq,
-       monitorUpstreamSse, collectChatStream, responsesSseToChatSse,
+       monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect,
        probeFreeModel, verifyFreeModels, freeModelHealth, workingFreeModelIds, hasModelOutput,
        catalogStatus,
        setFetcher(value) { fetchJsonDirect = value; },
@@ -190,6 +191,27 @@ describe('proxy pool regression checks', () => {
     await g.backgroundProbeSweep();
     await g.backgroundProbeSweep();
     expect(checked.size).toBe(items.length);
+  });
+
+  test('direct fallback respects its own 429 cooldown instead of hammering the same egress', async () => {
+    const g = fixture();
+    const pool = { keyId: 'key', slots: [], rrCursor: 0, lastUsedAt: g.now };
+    const body = JSON.stringify({ model: 'muse-spark-1.3-contributor-free', input: 'Hi', stream: false });
+    g.echo({ error: { type: 'FreeUsageLimitError', message: 'rate limited' } }, 100, 429);
+    const first = await g.dispatchDirect('/v1/responses', 'POST', { 'content-type': 'application/json' }, body, pool);
+    expect(first.status).toBe(429);
+    expect(g.requests).toBe(1);
+
+    const second = await g.dispatchDirect('/v1/responses', 'POST', { 'content-type': 'application/json' }, body, pool);
+    expect(second.status).toBe(503);
+    expect(Number(second.responseHeaders['retry-after'])).toBeGreaterThan(0);
+    expect(g.requests).toBe(1);
+
+    g.advance(30_001);
+    g.echo({ id: 'ok' }, 100, 200);
+    const recovered = await g.dispatchDirect('/v1/responses', 'POST', { 'content-type': 'application/json' }, body, pool);
+    expect(recovered.status).toBe(200);
+    expect(g.requests).toBe(2);
   });
 
   test('background success does not erase an upstream rate-limit cooldown', async () => {

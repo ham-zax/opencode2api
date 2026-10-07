@@ -559,6 +559,13 @@ const exitHealth = new Map<string, ExitHealth>();
 /** addr -> model -> { fails, bannedUntil } */
 const exitModelBans = new Map<string, Map<string, { fails: number; bannedUntil: number }>>();
 
+const DIRECT_EXIT_ADDR = '__direct__';
+
+function exitCooldownRemainingSeconds(addr: string): number {
+  const until = exitHealth.get(addr)?.cooldownUntil || 0;
+  return Math.max(0, Math.ceil((until - Date.now()) / 1000));
+}
+
 function exitState(addr: string): ExitHealth {
   let s = exitHealth.get(addr);
   if (!s) { s = { fails: 0, cooldownUntil: 0, cooldownStreak: 0 }; exitHealth.set(addr, s); }
@@ -2083,6 +2090,18 @@ async function dispatchDirect(
   path: string, method: string, headers: Record<string, string>,
   body: string | undefined, pool: KeySlotPool,
 ): Promise<DispatchResult> {
+  let dispatchModel: string | undefined;
+  if (body) { try { dispatchModel = (JSON.parse(body) as any)?.model; } catch {} }
+  const retryAfter = exitCooldownRemainingSeconds(DIRECT_EXIT_ADDR);
+  if (retryAfter > 0 || !isExitUsable(DIRECT_EXIT_ADDR, dispatchModel)) {
+    const wait = Math.max(1, retryAfter || Math.ceil(EXIT_COOLDOWN_BASE_MS / 1000));
+    console.log(`[Dispatch] direct connection cooling down for ${wait}s`);
+    return {
+      status: 503,
+      body: JSON.stringify({ error: { type: 'upstream_cooldown', message: 'Direct upstream egress is cooling down after a rate limit.' } }),
+      responseHeaders: { 'retry-after': String(wait) },
+    };
+  }
   console.log(`[Dispatch] fallback → Direct connection`);
   const start = Date.now();
   try {
@@ -2092,10 +2111,16 @@ async function dispatchDirect(
       const latencyMs = Date.now() - start;
       if (result.status >= 200 && result.status < 400) {
         stats.total++; stats.success++;
+        noteExitSuccess(DIRECT_EXIT_ADDR, dispatchModel);
         audit(result.status, latencyMs, 'direct', path, body, pool.keyId);
         return { status: result.status, stream: result.stream, streamHeaders: result.headers };
       }
-      stats.total++; stats.errors++;
+      stats.total++;
+      if (result.status === 429) {
+        stats.rateLimited++;
+        rememberRetryAfter(DIRECT_EXIT_ADDR, result.headers);
+        console.log(`[Dispatch] direct 429 -> ${noteExitFailure(DIRECT_EXIT_ADDR, 429, dispatchModel)}`);
+      } else stats.errors++;
       audit(result.status, latencyMs, 'direct', path, body, pool.keyId);
       const reader = result.stream.getReader();
       let directErr = '';
@@ -2116,10 +2141,16 @@ async function dispatchDirect(
     const latencyMs = Date.now() - start;
     if (result.status >= 200 && result.status < 400) {
       stats.total++; stats.success++;
+      noteExitSuccess(DIRECT_EXIT_ADDR, dispatchModel);
       audit(result.status, latencyMs, 'direct', path, result.body, pool.keyId);
       return { status: result.status, body: result.body };
     }
-    stats.total++; stats.errors++;
+    stats.total++;
+    if (result.status === 429) {
+      stats.rateLimited++;
+      rememberRetryAfter(DIRECT_EXIT_ADDR, result.headers);
+      console.log(`[Dispatch] direct 429 -> ${noteExitFailure(DIRECT_EXIT_ADDR, 429, dispatchModel)}`);
+    } else stats.errors++;
     audit(result.status, latencyMs, 'direct', path, result.body, pool.keyId);
     return { status: result.status, body: result.body, responseHeaders: result.headers };
   } catch (e: any) {
