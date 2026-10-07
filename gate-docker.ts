@@ -503,36 +503,88 @@ function shapeAgentRequest(
   return { body: JSON.stringify(parsed), callerWantsStream, reshaped: true };
 }
 
+function declaredToolNames(bodyStr: string | undefined): Set<string> {
+  const names = new Set<string>();
+  if (!bodyStr) return names;
+  try {
+    const parsed = JSON.parse(bodyStr);
+    if (!Array.isArray(parsed?.tools)) return names;
+    for (const tool of parsed.tools) {
+      const name = String(tool?.function?.name || tool?.name || '').trim();
+      if (name) names.add(name);
+    }
+  } catch {}
+  return names;
+}
+
+function authorizedToolNames(bodyStr: string | undefined): Set<string> {
+  const names = declaredToolNames(bodyStr);
+  if (!bodyStr) return names;
+  try {
+    const parsed = JSON.parse(bodyStr);
+    const choiceName = String(parsed?.tool_choice?.function?.name || parsed?.tool_choice?.name || '').trim();
+    if (choiceName) names.add(choiceName);
+    for (const message of Array.isArray(parsed?.messages) ? parsed.messages : []) {
+      for (const call of Array.isArray(message?.tool_calls) ? message.tool_calls : []) {
+        const name = String(call?.function?.name || call?.name || '').trim();
+        if (name) names.add(name);
+      }
+    }
+    for (const item of Array.isArray(parsed?.input) ? parsed.input : []) {
+      if (item?.type === 'function_call') {
+        const name = String(item?.name || '').trim();
+        if (name) names.add(name);
+      }
+    }
+  } catch {}
+  return names;
+}
+
 function requestDeclaresTools(bodyStr: string | undefined): boolean {
   if (!bodyStr) return false;
   try {
     const parsed = JSON.parse(bodyStr);
-    if (Array.isArray(parsed?.tools) && parsed.tools.length > 0) return true;
+    if (authorizedToolNames(bodyStr).size > 0) return true;
     if (parsed?.tool_choice != null) return true;
-    if (Array.isArray(parsed?.messages) && parsed.messages.some((m: any) => m?.role === 'tool' || (Array.isArray(m?.tool_calls) && m.tool_calls.length > 0))) return true;
-    if (Array.isArray(parsed?.input) && parsed.input.some((item: any) => item?.type === 'function_call' || item?.type === 'function_call_output')) return true;
+    if (Array.isArray(parsed?.messages) && parsed.messages.some((m: any) => m?.role === 'tool')) return true;
+    if (Array.isArray(parsed?.input) && parsed.input.some((item: any) => item?.type === 'function_call_output')) return true;
     return false;
   } catch {
     return false;
   }
 }
 
-function guardToolFreeStream(stream: ReadableStream<Uint8Array>, mode: 'chat' | 'responses'): ReadableStream<Uint8Array> {
+function guardToolPolicyStream(
+  stream: ReadableStream<Uint8Array>,
+  mode: 'chat' | 'responses',
+  allowedTools: Set<string>,
+): ReadableStream<Uint8Array> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  const assertAllowed = (name: string | undefined) => {
+    const normalized = String(name || '').trim();
+    if (!normalized) return;
+    if (!allowedTools.has(normalized)) {
+      throw new Error(`Blocked undeclared upstream tool call: ${normalized}`);
+    }
+  };
   const inspectLine = (line: string) => {
     if (!line.startsWith('data:')) return;
     const data = line.slice(5).trim();
     if (!data || data === '[DONE]') return;
     let evt: any;
     try { evt = JSON.parse(data); } catch { return; }
-    const syntheticCall = mode === 'responses'
-      ? (evt?.type === 'response.output_item.added' && evt?.item?.type === 'function_call')
-        || evt?.type === 'response.function_call_arguments.delta'
-        || evt?.type === 'response.function_call_arguments.done'
-      : Array.isArray(evt?.choices) && evt.choices.some((choice: any) => Array.isArray(choice?.delta?.tool_calls) && choice.delta.tool_calls.length > 0);
-    if (syntheticCall) throw new Error('Upstream attempted a synthetic tool call for a tool-free client');
+    if (mode === 'responses') {
+      if (evt?.type === 'response.output_item.added' && evt?.item?.type === 'function_call') assertAllowed(evt.item?.name);
+      if (evt?.type === 'response.output_item.done' && evt?.item?.type === 'function_call') assertAllowed(evt.item?.name);
+      return;
+    }
+    if (!Array.isArray(evt?.choices)) return;
+    for (const choice of evt.choices) {
+      for (const call of choice?.delta?.tool_calls || []) assertAllowed(call?.function?.name);
+      for (const call of choice?.message?.tool_calls || []) assertAllowed(call?.function?.name);
+    }
   };
   return new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -4109,7 +4161,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
     }
     let substitutedFrom: string | undefined;
     let substitutedTo: string | undefined;
-    let callerDeclaredTools = false;
+    let callerToolNames = new Set<string>();
     // Whether the caller asked for SSE. The agent shape forces stream:true
     // upstream, so a non-streaming caller is served by reassembling the SSE
     // back into a single JSON completion rather than being handed a stream.
@@ -4121,7 +4173,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
         return;
       }
       bodyStr = normalized.body;
-      callerDeclaredTools = requestDeclaresTools(bodyStr);
+      callerToolNames = authorizedToolNames(bodyStr);
       if (upstreamPath === '/v1/responses' && !isResponsesOnlyModel(JSON.parse(bodyStr!).model)) {
         sendJson(nodeRes, 400, { error: 'unsupported_transport', message: 'This model uses /v1/chat/completions' });
         return;
@@ -4250,9 +4302,9 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
         result.stream = responsesSseToChatSse(result.stream, responsesFallbackModel);
         result.streamHeaders = { ...(result.streamHeaders || {}), 'content-type': 'text/event-stream; charset=utf-8' };
       }
-      if (result.stream && !callerDeclaredTools) {
+      if (result.stream) {
         const clientMode: 'chat' | 'responses' = upstreamPath === '/v1/responses' && !usedResponses ? 'responses' : 'chat';
-        result.stream = guardToolFreeStream(result.stream, clientMode);
+        result.stream = guardToolPolicyStream(result.stream, clientMode, callerToolNames);
       }
 
       if (result.stream) {

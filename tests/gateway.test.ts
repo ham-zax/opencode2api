@@ -87,7 +87,7 @@ function fixture(probeTimeout = 2500) {
        setModels(value) { cachedModels = value; cachedModelsTime = Date.now(); },
        activeRequests, fetchModelsFromUpstream, ensureModelCatalog, loadModelCatalog,
        normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, chatBodyToResponses, collectHeadersFromReq,
-       requestDeclaresTools, guardToolFreeStream, monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect, sendJson, sendJsonWithHeaders,
+       declaredToolNames, authorizedToolNames, requestDeclaresTools, guardToolPolicyStream, monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect, sendJson, sendJsonWithHeaders,
        probeFreeModel, verifyFreeModels, freeModelHealth, workingFreeModelIds, hasModelOutput,
        catalogStatus,
        setFetcher(value) { fetchJsonDirect = value; },
@@ -932,13 +932,23 @@ describe('Zen discovery and health', () => {
     }
   });
 
-  test('tool-free response guard rejects synthetic tool calls', async () => {
+  test('tool policy guard blocks compatibility stubs that the caller did not declare', async () => {
     const g = fixture();
-    const chat = new ReadableStream({ start(controller) {
-      controller.enqueue(new TextEncoder().encode(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x","type":"function","function":{"name":"bash","arguments":"{}"}}]},"finish_reason":null}]}\n\n`));
+    const toolEvent = (name: string) => new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode(`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"x","type":"function","function":{"name":"${name}","arguments":"{}"}}]},"finish_reason":null}]}\n\n`));
       controller.close();
     }});
-    await expect(new Response(g.guardToolFreeStream(chat, 'chat')).text()).rejects.toThrow('synthetic tool call');
+
+    await expect(new Response(g.guardToolPolicyStream(toolEvent('bash'), 'chat', new Set())).text())
+      .rejects.toThrow('Blocked undeclared upstream tool call: bash');
+
+    const allowed = new Set(['read']);
+    expect(await new Response(g.guardToolPolicyStream(toolEvent('read'), 'chat', allowed)).text()).toContain('"name":"read"');
+    await expect(new Response(g.guardToolPolicyStream(toolEvent('bash'), 'chat', allowed)).text())
+      .rejects.toThrow('Blocked undeclared upstream tool call: bash');
+
+    expect([...g.declaredToolNames(JSON.stringify({ tools: [{ type: 'function', function: { name: 'read' } }] }))]).toEqual(['read']);
+    expect([...g.authorizedToolNames(JSON.stringify({ tool_choice: { type: 'function', function: { name: 'read' } } }))]).toEqual(['read']);
     expect(g.requestDeclaresTools(JSON.stringify({ tools: [] }))).toBe(false);
     expect(g.requestDeclaresTools(JSON.stringify({ tools: [{ type: 'function', function: { name: 'read' } }] }))).toBe(true);
   });
