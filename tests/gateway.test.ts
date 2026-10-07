@@ -99,7 +99,7 @@ function fixture(probeTimeout = 2500, env: Record<string, string> = {}) {
        getKeys() { return apiKeys; },
        setModels(value) { cachedModels = value; cachedModelsTime = Date.now(); },
        activeRequests, fetchModelsFromUpstream, ensureModelCatalog, loadModelCatalog,
-       normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, isNativeOpenCodeRequest, parseResidentialProxy, chooseResidentialSlot, isExitUsable, noteExitFailure, loadResidentialSlots, dispatchPatiently, setResidential(value) { residentialSlots = value; }, getResidential() { return residentialSlots; }, chatBodyToResponses, collectHeadersFromReq,
+       normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, isNativeOpenCodeRequest, parseResidentialProxy, chooseResidentialSlot, choosePoolSlot, isExitUsable, noteExitFailure, loadResidentialSlots, dispatchPatiently, setResidential(value) { residentialSlots = value; }, getResidential() { return residentialSlots; }, chatBodyToResponses, collectHeadersFromReq,
        declaredToolNames, authorizedToolNames, requestDeclaresTools, guardToolPolicyStream, monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect, sendJson, sendJsonWithHeaders,
        probeFreeModel, verifyFreeModels, freeModelHealth, workingFreeModelIds, hasModelOutput,
        catalogStatus,
@@ -1145,6 +1145,30 @@ describe('Zen discovery and health', () => {
     // A transport failure is a short cooldown, never an eviction.
     for (let i = 0; i < 10; i++) expect(g.noteExitFailure(env[1].addr, 502, 'big-pickle')).toContain('residential cooldown');
     expect(g.noteExitFailure(env[1].addr, 502, 'big-pickle')).not.toContain('evicted');
+  });
+
+  test('a public exit is retired after its request budget and returns when the window ends', () => {
+    const g = fixture(2500, { PUBLIC_EXIT_BUDGET: '3', PUBLIC_EXIT_WINDOW_MS: '60000' });
+    const slot = (addr: string) => ({ addr, url: `http://${addr}`, proto: 'http', latencyMs: 10, qualityGrade: 'A' });
+    const pool = { keyId: 'k', slots: [slot('9.9.9.1:80'), slot('9.9.9.2:80')], rrCursor: 0, lastUsedAt: 0 };
+    const used: string[] = [];
+    for (let i = 0; i < 6; i++) used.push(g.choosePoolSlot(pool, 'big-pickle', '', new Set()).addr);
+    // Each exit carried exactly its budget, so both are now retired.
+    expect(used.filter(a => a === '9.9.9.1:80').length).toBe(3);
+    expect(used.filter(a => a === '9.9.9.2:80').length).toBe(3);
+    expect(g.isExitUsable('9.9.9.1:80', 'big-pickle')).toBe(false);
+    expect(g.choosePoolSlot(pool, 'big-pickle', '', new Set())).toBeNull();
+
+    g.advance(60_001);
+    expect(g.isExitUsable('9.9.9.1:80', 'big-pickle')).toBe(true);
+  });
+
+  test('residential exits are exempt from the public request budget', () => {
+    const g = fixture(2500, { PUBLIC_EXIT_BUDGET: '2' });
+    const [r] = [g.parseResidentialProxy('1.1.1.1:80')];
+    g.setResidential([r]);
+    for (let i = 0; i < 5; i++) expect(g.chooseResidentialSlot('big-pickle', new Set()).addr).toBe(r.addr);
+    expect(g.isExitUsable(r.addr, 'big-pickle')).toBe(true);
   });
 
   test('a request is held for the soonest exit instead of returning 429', async () => {

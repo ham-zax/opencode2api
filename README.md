@@ -334,6 +334,8 @@ OpenCode2API can be configured via environment variables in `docker-compose.yml`
 | `DATA_DIR` | `./data` | Directory for persistent storage (`keys.json`, `sources.json`, `audit.jsonl`). |
 | `RESIDENTIAL_PROXIES` | _(empty)_ | Paid residential exits (comma/newline separated; `scheme://user:pass@host:port`, `host:port:user:pass` or `host:port`). Also read from `DATA_DIR/residential_proxies.txt` (keep it mode 600). Tried before any public proxy, never evicted, and logged without credentials. |
 | `DISPATCH_PATIENCE_MS` | `20000` | When every exit is cooling down after a 429/503, hold the request for the soonest recovery up to this long instead of returning the error. `0` disables. |
+| `PUBLIC_EXIT_BUDGET` | `60` | Public-pool rotation: a shared public exit is retired after this many requests inside `PUBLIC_EXIT_WINDOW_MS`, before Zen's per-IP limit hits it, and a fresh validated exit replaces it. Residential, WARP, direct and custom exits are exempt. `0` disables. |
+| `PUBLIC_EXIT_WINDOW_MS` | `3600000` | Length of the per-exit budget window (one hour). |
 | `SLOTS_PER_KEY` | `3` | Fixed minimum proxy routes per API key, not a generation concurrency limit. |
 | `MAX_PROXY_SLOTS_PER_KEY` | `16` | Maximum retained proxy routes per key as concurrent demand grows. Does not limit admitted generations. |
 | `MAX_ACTIVE_KEYS` | `20` | Maximum number of keys active simultaneously. |

@@ -837,9 +837,38 @@ function exitState(addr: string): ExitHealth {
   return s;
 }
 
+// Public-pool rotation: a shared public exit is retired once it has carried
+// PUBLIC_EXIT_BUDGET requests inside PUBLIC_EXIT_WINDOW_MS, before Zen's per-IP
+// limit does it for us. Residential, WARP, direct and custom exits are exempt.
+const PUBLIC_EXIT_BUDGET = parseInt(process.env.PUBLIC_EXIT_BUDGET || '60');
+const PUBLIC_EXIT_WINDOW_MS = parseInt(process.env.PUBLIC_EXIT_WINDOW_MS || String(60 * 60_000));
+const exitUseWindow = new Map<string, { start: number; count: number }>();
+
+function isBudgetedExit(addr: string): boolean {
+  return PUBLIC_EXIT_BUDGET > 0 && !isResidentialAddr(addr) && addr !== DIRECT_EXIT_ADDR
+    && addr !== getWarpAddr() && !customSlots.some(cs => cs.addr === addr);
+}
+
+function exitBudgetExhausted(addr: string): boolean {
+  const w = exitUseWindow.get(addr);
+  if (!w) return false;
+  if (Date.now() - w.start >= PUBLIC_EXIT_WINDOW_MS) { exitUseWindow.delete(addr); return false; }
+  return w.count >= PUBLIC_EXIT_BUDGET;
+}
+
+function noteExitUse(addr: string): void {
+  if (!isBudgetedExit(addr)) return;
+  const now = Date.now();
+  let w = exitUseWindow.get(addr);
+  if (!w || now - w.start >= PUBLIC_EXIT_WINDOW_MS) { w = { start: now, count: 0 }; exitUseWindow.set(addr, w); }
+  w.count += 1;
+  if (w.count === PUBLIC_EXIT_BUDGET) console.log(`[Rotate] ${addr} reached ${PUBLIC_EXIT_BUDGET} requests, retiring for ${Math.round(PUBLIC_EXIT_WINDOW_MS / 60_000)}m`);
+}
+
 function isExitUsable(addr: string, model: string | undefined): boolean {
   const s = exitHealth.get(addr);
   if (s && s.cooldownUntil > Date.now()) return false;
+  if (exitBudgetExhausted(addr)) return false;
   if (model) {
     const bans = exitModelBans.get(addr);
     const b = bans?.get(model);
@@ -2703,6 +2732,7 @@ function choosePoolSlot(pool: KeySlotPool, model: string | undefined, session: s
     if (sessionExits.size > 4096) sessionExits.delete(sessionExits.keys().next().value!);
   }
   pool.rrCursor = (pool.slots.indexOf(chosen) + 1) % pool.slots.length;
+  noteExitUse(chosen.addr);
   return chosen;
 }
 
@@ -3944,6 +3974,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       candidatesCount: candidates.length,
       candidates: candidates.length,
       customSlotsCount: customSlots.length,
+      exitBudget: { limit: PUBLIC_EXIT_BUDGET, windowMinutes: Math.round(PUBLIC_EXIT_WINDOW_MS / 60_000), retired: [...exitUseWindow.keys()].filter(exitBudgetExhausted).length },
       residential: { count: residentialSlots.length, coolingDown: residentialSlots.filter(s => exitCooldownRemainingSeconds(s.addr) > 0).length },
       totalApiKeys: Object.keys(apiKeys).length,
       timeouts: {
