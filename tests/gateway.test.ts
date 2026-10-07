@@ -84,6 +84,7 @@ function fixture(probeTimeout = 2500) {
        setModels(value) { cachedModels = value; cachedModelsTime = Date.now(); },
        activeRequests, fetchModelsFromUpstream, ensureModelCatalog, loadModelCatalog,
        normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, collectHeadersFromReq,
+       monitorUpstreamSse, collectChatStream, responsesSseToChatSse,
        probeFreeModel, verifyFreeModels, freeModelHealth, workingFreeModelIds, hasModelOutput,
        catalogStatus,
        setFetcher(value) { fetchJsonDirect = value; },
@@ -394,6 +395,43 @@ describe('HTTP compatibility', () => {
       expect(g.getKeys()['test-key'].totalTokens).toBe(3);
       expect(g.activeRequests['test-key']).toBe(0);
     });
+  });
+
+  test('chat collector rejects a truncated stream with no finish_reason', async () => {
+    const g = fixture();
+    const broken = new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n'));
+      controller.close();
+    } });
+    const collected = await g.collectChatStream(broken, 'big-pickle');
+    expect(collected.status).toBe(502);
+    expect(JSON.parse(collected.body).error.message).toContain('finish_reason');
+  });
+
+  test('stream monitor rejects premature chat EOF and only marks terminal streams complete', async () => {
+    const g = fixture();
+    let completed = 0, failed = 0;
+    const broken = new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}\n\n'));
+      controller.close();
+    } });
+    const monitoredBroken = g.monitorUpstreamSse(broken, 'chat', { onComplete: () => completed++, onFailure: () => failed++ });
+    await expect(new Response(monitoredBroken).text()).rejects.toThrow('terminal event');
+    expect(completed).toBe(0); expect(failed).toBe(1);
+
+    const monitoredGood = g.monitorUpstreamSse(replyStream(), 'chat', { onComplete: () => completed++, onFailure: () => failed++ });
+    expect(await new Response(monitoredGood).text()).toContain('data: [DONE]');
+    expect(completed).toBe(1); expect(failed).toBe(1);
+  });
+
+  test('Responses translation rejects premature EOF instead of synthesizing stop', async () => {
+    const g = fixture();
+    const broken = new ReadableStream({ start(controller) {
+      controller.enqueue(new TextEncoder().encode('data: {"type":"response.output_text.delta","delta":"partial"}\n\n'));
+      controller.close();
+    } });
+    const translated = g.responsesSseToChatSse(g.monitorUpstreamSse(broken, 'responses'), 'muse-spark-1.3-contributor-free');
+    await expect(new Response(translated).text()).rejects.toThrow('terminal event');
   });
 
   test('stream clients receive SSE through the terminal DONE frame', async () => {

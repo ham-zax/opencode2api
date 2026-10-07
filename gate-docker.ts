@@ -325,7 +325,8 @@ const UPSTREAM = 'https://opencode.ai/zen';
 const PORT = parseInt(process.env.PORT || '13339');
 const MAX_RETRIES = 3;
 const TIMEOUT = 15000;
-const STREAM_TIMEOUT = 60000;
+const STREAM_TIMEOUT = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS || '600000');
+const PROXY_CONNECT_TIMEOUT_MS = parseInt(process.env.PROXY_CONNECT_TIMEOUT_MS || '15000');
 
 const MAX_ACTIVE_KEYS = 20;
 const SLOTS_PER_KEY = 3;
@@ -1045,7 +1046,7 @@ async function loadCandidates(): Promise<void> {
 //  Health Checking
 // ═══════════════════════════════════════════════════════════
 
-function makeAgent(url: string, proto: 'http' | 'socks5', timeoutMs = STREAM_TIMEOUT): https.Agent {
+function makeAgent(url: string, proto: 'http' | 'socks5', timeoutMs = PROXY_CONNECT_TIMEOUT_MS): https.Agent {
   if (proto === 'socks5') {
     return new SocksProxyAgent(url, { timeout: timeoutMs }) as unknown as https.Agent;
   }
@@ -1870,8 +1871,20 @@ function doHttpsStream(
           try { streamController?.error(e); } catch {}
         }
       });
+      res.on('aborted', () => {
+        const e = new Error('Upstream response aborted before completion');
+        cleanup();
+        if (!firstChunkReceived) {
+          if (!resolved) { resolved = true; reject(e); }
+        } else {
+          try { streamController?.error(e); } catch {}
+        }
+      });
     });
 
+    req.on('socket', (socket) => {
+      try { socket.setKeepAlive(true, 30_000); } catch {}
+    });
     req.on('error', (e: Error) => {
       cleanup();
       if (!resolved) {
@@ -1887,6 +1900,91 @@ function doHttpsStream(
     });
     if (body) req.write(body);
     req.end();
+  });
+}
+
+type SseTerminalMode = 'chat' | 'responses';
+
+function monitorUpstreamSse(
+  stream: ReadableStream<Uint8Array>,
+  mode: SseTerminalMode,
+  callbacks: { onComplete?: () => void; onFailure?: (error: Error) => void } = {},
+): ReadableStream<Uint8Array> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let terminal = false;
+  let settled = false;
+  let cancelled = false;
+
+  const settleComplete = () => {
+    if (settled) return;
+    settled = true;
+    callbacks.onComplete?.();
+  };
+  const settleFailure = (error: Error) => {
+    if (settled || cancelled) return;
+    settled = true;
+    callbacks.onFailure?.(error);
+  };
+  const inspectLine = (line: string) => {
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') return;
+    let evt: any;
+    try { evt = JSON.parse(data); } catch { return; }
+    if (evt?.error || evt?.type === 'error' || evt?.type === 'response.failed') {
+      const message = evt?.error?.message || evt?.response?.error?.message || 'Upstream SSE reported an error';
+      throw new Error(message);
+    }
+    if (mode === 'responses') {
+      if (evt?.type === 'response.completed' || evt?.type === 'response.incomplete') terminal = true;
+      return;
+    }
+    if (Array.isArray(evt?.choices) && evt.choices.some((choice: any) => choice?.finish_reason != null)) terminal = true;
+  };
+  const inspect = (value: Uint8Array | undefined, final = false) => {
+    if (value) buffer += decoder.decode(value, { stream: !final });
+    else if (final) buffer += decoder.decode();
+    const lines = buffer.split(/\r?\n/);
+    const tail = lines.pop() || '';
+    buffer = final ? '' : tail;
+    for (const line of lines) inspectLine(line);
+    if (final && tail) inspectLine(tail);
+  };
+
+  return new ReadableStream<Uint8Array>({
+    async start(controller) {
+      try {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            inspect(value);
+            controller.enqueue(value);
+          }
+        }
+        inspect(undefined, true);
+        if (!terminal) throw new Error(`Upstream ${mode} SSE ended without a terminal event`);
+        settleComplete();
+        controller.close();
+      } catch (e: any) {
+        const error = e instanceof Error ? e : new Error(String(e));
+        if (terminal) {
+          settleComplete();
+          try { controller.close(); } catch {}
+        } else {
+          settleFailure(error);
+          try { controller.error(error); } catch {}
+        }
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
+    },
+    cancel(reason) {
+      cancelled = true;
+      return reader.cancel(reason);
+    },
   });
 }
 
@@ -2098,12 +2196,23 @@ async function dispatch(
       if (result.status >= 200 && result.status < 400) {
         isStreamHandedOff = true;
         stats.total++;
-        stats.success++;
-        console.log(`[Dispatch] ${selectedSlot.addr} stream OK ${result.status} (${latencyMs}ms) pool=${pool.keyId.slice(0,7)}...`);
+        console.log(`[Dispatch] ${selectedSlot.addr} stream opened ${result.status} (${latencyMs}ms) pool=${pool.keyId.slice(0,7)}...`);
         rememberRetryAfter(selectedSlot.addr, result.headers);
-        noteExitSuccess(selectedSlot.addr, dispatchModel);
         audit(result.status, latencyMs, selectedSlot.addr, path, body, pool.keyId);
-        return { status: result.status, stream: result.stream, streamHeaders: result.headers };
+        const monitored = monitorUpstreamSse(result.stream, path.includes('/responses') ? 'responses' : 'chat', {
+          onComplete: () => {
+            stats.success++;
+            noteExitSuccess(selectedSlot!.addr, dispatchModel);
+            console.log(`[Dispatch] ${selectedSlot!.addr} stream completed cleanly`);
+          },
+          onFailure: (error) => {
+            stats.errors++;
+            const verdict = noteExitFailure(selectedSlot!.addr, 0, dispatchModel);
+            console.warn(`[Dispatch] ${selectedSlot!.addr} stream failed after handoff: ${error.message} -> ${verdict}`);
+            void replaceFailedSlot(pool, selectedSlot!.addr);
+          },
+        });
+        return { status: result.status, stream: monitored, streamHeaders: result.headers };
       }
       // Read error response body
       const reader = result.stream.getReader();
@@ -2383,7 +2492,7 @@ async function collectChatStream(
   let model = fallbackModel;
   let id = '';
   let created = 0;
-  let finishReason = 'stop';
+  let finishReason: string | null = null;
   const toolCalls = new Map<number, any>();
   let promptTokens = 0, completionTokens = 0, totalTokens = 0;
 
@@ -2437,6 +2546,9 @@ async function collectChatStream(
 
   if (!text && !toolCalls.size && totalTokens === 0) {
     return { status: 502, body: JSON.stringify({ error: { message: 'upstream produced no content' } }) };
+  }
+  if (!finishReason) {
+    return { status: 502, body: JSON.stringify({ error: { message: 'upstream chat stream ended without finish_reason' } }) };
   }
   return {
     status: 200,
@@ -2616,8 +2728,8 @@ function responsesSseToChatSse(
           argumentsDone(evt.item_id || String(evt.output_index), evt); return;
         }
         if (type === 'error' || type === 'response.failed' || evt.error) {
-          emit(JSON.stringify({ error: evt.error || evt.response?.error || { message: 'responses stream failed' } }));
-          sentFinish = true; controller.close(); return;
+          const message = evt.error?.message || evt.response?.error?.message || 'responses stream failed';
+          throw new Error(message);
         }
         if (type === 'response.output_text.delta') {
           if (!sentRole) { sentRole = true; emit(chunk({ role: 'assistant', content: '' }, null)); }
@@ -2655,22 +2767,21 @@ function responsesSseToChatSse(
               if (!line.startsWith('data:')) continue;
               const data = line.slice(5).trim();
               if (!data || data === '[DONE]') continue;
-              try { handle(JSON.parse(data)); } catch {}
+              let evt: any;
+              try { evt = JSON.parse(data); } catch { continue; }
+              handle(evt);
             }
           }
           if (sentFinish) { try { await reader.cancel(); } catch {} return; }
         }
       } catch (e: any) {
-        try {
-          emit(JSON.stringify({ error: { message: e?.message || 'responses stream failed' } }));
-        } catch {}
+        const error = e instanceof Error ? e : new Error(e?.message || 'responses stream failed');
+        try { controller.error(error); } catch {}
+        return;
       } finally {
         if (!sentFinish) {
-          sentFinish = true;
-          try { emit(chunk({}, 'stop')); } catch {}
-          try { controller.enqueue(encoder.encode('data: [DONE]\n\n')); } catch {}
+          try { await reader.cancel(); } catch {}
         }
-        try { controller.close(); } catch {}
       }
     },
     cancel(reason) { return reader.cancel(reason); },
@@ -3914,6 +4025,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
         let streamUsageBuffer = '';
         let streamTokens = 0;
         const streamDecoder = new TextDecoder();
+        let streamReadError: Error | null = null;
         try {
           while (!clientClosed) {
             const { done, value } = await reader.read();
@@ -3937,9 +4049,11 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
             }
           }
         } catch (err: any) {
-          console.warn(`[Dispatch] Stream read interrupted:`, err?.message || err);
+          streamReadError = err instanceof Error ? err : new Error(String(err));
+          console.warn(`[Dispatch] Stream read interrupted:`, streamReadError.message);
         } finally {
-          nodeRes.end();
+          if (streamReadError && !clientClosed) nodeRes.destroy(streamReadError);
+          else nodeRes.end();
           if (streamTokens > 0) recordKeyUsage(authKey, streamTokens);
         }
       } else {
