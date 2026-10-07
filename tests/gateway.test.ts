@@ -394,6 +394,18 @@ describe('HTTP compatibility', () => {
     return new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(body)); controller.close(); } });
   }
 
+  test('status exposes stream and direct-egress health controls', async () => {
+    await withServer(async base => {
+      const response = await fetch(base + '/api/status');
+      expect(response.status).toBe(200);
+      const doc = await response.json();
+      expect(doc.timeouts.streamIdleMs).toBe(600000);
+      expect(doc.timeouts.proxyConnectMs).toBe(15000);
+      expect(doc.directEgress.usable).toBe(true);
+      expect(doc.directEgress.retryAfterSeconds).toBe(0);
+    });
+  });
+
   test('models require a valid key and support the /openai prefix', async () => {
     await withServer(async base => {
       expect((await fetch(base + '/v1/models')).status).toBe(401);

@@ -3342,6 +3342,16 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       candidates: candidates.length,
       customSlotsCount: customSlots.length,
       totalApiKeys: Object.keys(apiKeys).length,
+      timeouts: {
+        nonStreamMs: TIMEOUT,
+        streamIdleMs: STREAM_TIMEOUT,
+        proxyConnectMs: PROXY_CONNECT_TIMEOUT_MS,
+        proxyProbeMs: PROXY_PROBE_TIMEOUT,
+      },
+      directEgress: {
+        usable: isExitUsable(DIRECT_EXIT_ADDR, undefined),
+        retryAfterSeconds: exitCooldownRemainingSeconds(DIRECT_EXIT_ADDR),
+      },
       pool: {
         state: currentPoolState(),
         freeExits: freeExitCount(),
