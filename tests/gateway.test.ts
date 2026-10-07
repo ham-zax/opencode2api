@@ -72,7 +72,7 @@ function fixture(probeTimeout = 2500) {
   const gateway: any = vm.runInContext(definitions + `
     ({ coarseScreen, probe, backgroundProbeSweep, allocateKeySlots, loadCandidates,
        replaceFailedSlot, getKeySlotPool, releaseKeySlots,
-       freeExitCount, currentPoolState, markValidated, noteExitFailure,
+       freeExitCount, currentPoolState, poolGenerationConcurrencyCap, waitForPoolGenerationCapacity, markValidated, noteExitFailure,
        isExitUsable, validatedExits, exitHealth, keySlotPools, coarseSeen,
        setCandidates(value) { candidates = value; },
        getCandidates() { return candidates; },
@@ -86,7 +86,7 @@ function fixture(probeTimeout = 2500) {
        setModels(value) { cachedModels = value; cachedModelsTime = Date.now(); },
        activeRequests, fetchModelsFromUpstream, ensureModelCatalog, loadModelCatalog,
        normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, chatBodyToResponses, collectHeadersFromReq,
-       requestDeclaresTools, guardToolFreeStream, monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect, sendJson,
+       requestDeclaresTools, guardToolFreeStream, monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect, sendJson, sendJsonWithHeaders,
        probeFreeModel, verifyFreeModels, freeModelHealth, workingFreeModelIds, hasModelOutput,
        catalogStatus,
        setFetcher(value) { fetchJsonDirect = value; },
@@ -130,6 +130,14 @@ describe('proxy pool regression checks', () => {
     expect(g.currentPoolState()).toBe('degraded');
     g.advance(15 * 60_000 + 1);
     expect(g.freeExitCount()).toBe(0);
+  });
+
+  test('generation concurrency cap tightens as pool capacity falls', () => {
+    const g = fixture();
+    expect(g.poolGenerationConcurrencyCap('degraded')).toBe(1);
+    expect(g.poolGenerationConcurrencyCap('constrained')).toBe(2);
+    expect(g.poolGenerationConcurrencyCap('watch')).toBeGreaterThanOrEqual(2);
+    expect(Number.isFinite(g.poolGenerationConcurrencyCap('healthy'))).toBe(false);
   });
 
   test('cached screen measurements obey the current admission ceiling', async () => {
@@ -457,6 +465,37 @@ describe('HTTP compatibility', () => {
       expect(response.headers.get('retry-after')).toBe('30');
       await response.text();
     });
+  });
+
+  test('degraded pool queues a brief concurrent burst instead of rejecting it', async () => {
+    await withServer(async (base, g) => {
+      let calls = 0;
+      g.setDispatch(async () => {
+        calls++;
+        if (calls === 1) await new Promise(resolve => setTimeout(resolve, 25));
+        return { status: 200, stream: replyStream() };
+      });
+      const first = fetch(base + '/v1/chat/completions', { method: 'POST', headers, body: completion(false) });
+      await new Promise(resolve => setTimeout(resolve, 5));
+      const second = fetch(base + '/v1/chat/completions', { method: 'POST', headers, body: completion(false) });
+      const [a, b] = await Promise.all([first, second]);
+      expect(a.status).toBe(200);
+      expect(b.status).toBe(200);
+      expect(calls).toBe(2);
+    });
+  });
+
+  test('degraded pool eventually returns retry guidance when saturation persists', async () => {
+    const g = fixture();
+    g.activeRequests['test-key'] = 1;
+    const pending = g.waitForPoolGenerationCapacity('test-key', 5);
+    g.advance(5);
+    g.fireTimers(5);
+    const result = await pending;
+    expect(result.ok).toBe(false);
+    expect(result.state).toBe('degraded');
+    expect(result.cap).toBe(1);
+    expect(result.waitedMs).toBeGreaterThanOrEqual(5);
   });
 
   test('non-stream clients receive assembled JSON and usage is counted once', async () => {

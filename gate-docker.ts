@@ -1204,6 +1204,8 @@ type PoolState = 'healthy' | 'watch' | 'constrained' | 'degraded';
 
 // Free (unlocked) exits needed to serve every key without contention.
 const POOL_TARGET = Math.max(60, SLOTS_PER_KEY * MAX_ACTIVE_KEYS * 2);
+const POOL_BACKPRESSURE_WAIT_MS = parseInt(process.env.POOL_BACKPRESSURE_WAIT_MS || '30000');
+const POOL_BACKPRESSURE_POLL_MS = Math.max(25, parseInt(process.env.POOL_BACKPRESSURE_POLL_MS || '100'));
 const POOL_TIERS: Record<PoolState, { min: number; admitMs: number; scrapeAll: boolean }> = {
   healthy:   { min: POOL_TARGET,      admitMs: 1200, scrapeAll: false },
   watch:      { min: Math.round(POOL_TARGET * 0.4), admitMs: 2000, scrapeAll: false },
@@ -1244,6 +1246,26 @@ function currentPoolState(): PoolState {
   if (free >= POOL_TIERS.watch.min) return 'watch';
   if (free >= POOL_TIERS.constrained.min) return 'constrained';
   return 'degraded';
+}
+
+function poolGenerationConcurrencyCap(state = currentPoolState()): number {
+  if (state === 'degraded') return 1;
+  if (state === 'constrained') return 2;
+  if (state === 'watch') return Math.max(2, SLOTS_PER_KEY);
+  return Number.POSITIVE_INFINITY;
+}
+
+async function waitForPoolGenerationCapacity(key: string, maxWaitMs = POOL_BACKPRESSURE_WAIT_MS): Promise<{ ok: boolean; state: PoolState; cap: number; waitedMs: number }> {
+  const started = Date.now();
+  for (;;) {
+    const state = currentPoolState();
+    const cap = poolGenerationConcurrencyCap(state);
+    const active = activeRequests[key] || 0;
+    if (!Number.isFinite(cap) || active < cap) return { ok: true, state, cap, waitedMs: Date.now() - started };
+    const waitedMs = Date.now() - started;
+    if (waitedMs >= maxWaitMs) return { ok: false, state, cap, waitedMs };
+    await new Promise(resolve => setTimeout(resolve, Math.min(POOL_BACKPRESSURE_POLL_MS, Math.max(1, maxWaitMs - waitedMs))));
+  }
 }
 
 /** Latency ceiling for admitting a new exit right now. */
@@ -2569,14 +2591,19 @@ function retryResponseHeaders(status: number, upstream: Record<string, string> |
   return { 'retry-after': String(Math.ceil(EXIT_COOLDOWN_BASE_MS / 1000)) };
 }
 
-function sendJson(nodeRes: http.ServerResponse, status: number, data: any) {
+function sendJsonWithHeaders(nodeRes: http.ServerResponse, status: number, data: any, headers: Record<string, string> = {}) {
   const body = JSON.stringify(data);
   nodeRes.writeHead(status, {
     'content-type': 'application/json',
     'access-control-allow-origin': '*',
     ...retryResponseHeaders(status, undefined),
+    ...headers,
   });
   nodeRes.end(body);
+}
+
+function sendJson(nodeRes: http.ServerResponse, status: number, data: any) {
+  sendJsonWithHeaders(nodeRes, status, data);
 }
 
 // Native Responses clients keep their response schema when stream:false.
@@ -3435,6 +3462,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
         state: currentPoolState(),
         freeExits: freeExitCount(),
         target: POOL_TARGET,
+        backpressureWaitMs: POOL_BACKPRESSURE_WAIT_MS,
         admitCeilingMs: admissionCeilingMs(),
         validatedTotal: validatedExits.size,
         grades: candidates.reduce((acc: any, c) => {
@@ -4050,10 +4078,33 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
     const reqHeaders = collectHeadersFromReq(nodeReq, bodyStr);
     // Recheck immediately before reservation: catalog/body awaits above may
     // have admitted another request or allowed a key to expire/be disabled.
+    // Explicit per-key policy takes precedence over adaptive pool backpressure.
     const admission = validateKey(authKey);
     if (!admission.ok) {
       sendJson(nodeRes, 403, { error: 'forbidden', message: admission.reason });
       return;
+    }
+    // Under low-capacity pool states, protect the few surviving exits from a
+    // thundering herd. This only applies when the key itself permits more
+    // concurrency than the current proxy reserve can safely support.
+    if (isGeneration) {
+      const capacity = await waitForPoolGenerationCapacity(authKey);
+      if (capacity.waitedMs > 0) {
+        console.log(`[Admission] pool=${capacity.state} cap=${capacity.cap} key=${authKey.slice(0, 7)}... waited=${capacity.waitedMs}ms`);
+      }
+      if (!capacity.ok) {
+        const active = activeRequests[authKey] || 0;
+        console.log(`[Admission] pool=${capacity.state} active=${active} cap=${capacity.cap} key=${authKey.slice(0, 7)}... -> backpressure`);
+        sendJsonWithHeaders(nodeRes, 503, {
+          type: 'pool_backpressure',
+          message: `Proxy pool is ${capacity.state}; retry after current generation traffic drains.`,
+          poolState: capacity.state,
+          activeRequests: active,
+          concurrencyCap: capacity.cap,
+          waitedMs: capacity.waitedMs,
+        }, { 'retry-after': '5' });
+        return;
+      }
     }
     acquireKey(authKey);
     if (isGeneration) recordKeyRequest(authKey);
