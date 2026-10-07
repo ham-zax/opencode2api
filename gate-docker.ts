@@ -261,6 +261,18 @@ const DEFAULT_SOURCES = [
     type: 'json' as const,
     parser: geonodeParser,
   },
+  {
+    name: 'iplocate-socks5',
+    url: 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt',
+    type: 'text' as const,
+    parser: textParser('socks5'),
+  },
+  {
+    name: 'iplocate-http',
+    url: 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt',
+    type: 'text' as const,
+    parser: textParser('http'),
+  },
 ];
 
 let proxySources: typeof DEFAULT_SOURCES = [];
@@ -406,8 +418,11 @@ let modelsVerified = false;
 // used from within OpenCode"), which is why testing them one at a time is
 // misleading — a fix for one looks like it did nothing.
 //
-// Tool count, system-prompt size, tool_choice and max_tokens were all ablated
-// and are irrelevant; five stub tool definitions are enough.
+// Re-checked against Zen with OpenCode 2.0.22: those two conditions are no
+// longer sufficient for a non-native body (stub tools and an injected system
+// message also 403), but a genuine OpenCode body is accepted verbatim. Native
+// clients are therefore forwarded untouched (isNativeOpenCodeRequest) and the
+// shaping below is a best-effort path for everything else.
 //
 // Set FREE_TIER_AGENT_SHAPE=0 to turn this off and send bodies verbatim.
 const FREE_TIER_AGENT_SHAPE = (process.env.FREE_TIER_AGENT_SHAPE || '1') !== '0';
@@ -435,6 +450,18 @@ function canonicalSessionID(signal: string): string {
     acc /= 62n;
   }
   return `ses_${timePart}${tail}`;
+}
+
+// True for a request that came from a genuine OpenCode client: opencode user
+// agent, a canonical session id it generated itself, and an already-streaming
+// body. Verified against Zen: replaying such a body verbatim returns 200, while
+// the same body with injected stub tools / system message returns 403.
+function isNativeOpenCodeRequest(nodeReq: http.IncomingMessage, bodyStr: string): boolean {
+  if (!FREE_TIER_AGENT_SHAPE) return false;
+  const ua = String(nodeReq.headers['user-agent'] || '');
+  const session = String(nodeReq.headers['x-opencode-session'] || '');
+  if (!ua.startsWith('opencode/') || !CANONICAL_SESSION_RE.test(session)) return false;
+  try { return (JSON.parse(bodyStr) as any)?.stream === true; } catch { return false; }
 }
 
 function freeTierStubToolset(names: string[]): any[] {
@@ -643,7 +670,7 @@ const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
 const MODEL_CATALOG_MAX_STALE_MS = 24 * 60 * 60 * 1000;
 const MODEL_CATALOG_RETRY_MS = 30 * 1000;
 const MODEL_CATALOG_FILE = path.join(DATA_DIR, 'models_cache.json');
-const OPENCODE_USER_AGENT = process.env.OPENCODE_USER_AGENT || 'opencode/latest/2.0.21/cli';
+const OPENCODE_USER_AGENT = process.env.OPENCODE_USER_AGENT || 'opencode/latest/2.0.22/cli';
 let catalogRefresh: Promise<ZenModel[]> | null = null;
 let catalogLastAttempt = 0;
 let catalogLastError = '';
@@ -654,6 +681,112 @@ const API_KEY = process.env.API_KEY || 'admin123';
 let candidates: CandidateItem[] = [];
 let customSlots: Slot[] = [];
 const PROXY_MAX_FAILS = 3;
+
+// ── Residential tier ──
+// Paid residential exits are tried before any public proxy. Zen limits per IP,
+// and these IPs are not shared with other scrapers, so they rarely start out
+// rate-limited. Credentials stay in `url`; `addr` is a label safe to log.
+const RESIDENTIAL_FILE = path.join(DATA_DIR, 'residential_proxies.txt');
+let residentialSlots: Slot[] = [];
+const residentialLastUsed = new Map<string, number>();
+
+function isResidentialAddr(addr: string): boolean {
+  return addr.startsWith('res:');
+}
+
+// Accepts `scheme://user:pass@host:port`, `user:pass@host:port`,
+// `host:port:user:pass` and bare `host:port`. http/https -> http, socks5/socks5h -> socks5.
+function parseResidentialProxy(line: string): Slot | null {
+  const raw = line.trim();
+  if (!raw || raw.startsWith('#')) return null;
+  const scheme = /^([a-z0-9]+):\/\//i.exec(raw)?.[1]?.toLowerCase() || 'http';
+  if (!['http', 'https', 'socks5', 'socks5h'].includes(scheme)) return null;
+  const rest = raw.replace(/^[a-z0-9]+:\/\//i, '');
+  let host: string, port: string, user = '', pass = '';
+  const at = rest.lastIndexOf('@');
+  if (at >= 0) {
+    const cred = rest.slice(0, at);
+    const colon = cred.indexOf(':');
+    user = colon >= 0 ? cred.slice(0, colon) : cred;
+    pass = colon >= 0 ? cred.slice(colon + 1) : '';
+    [host, port] = rest.slice(at + 1).split(':');
+  } else {
+    const parts = rest.split(':');
+    if (parts.length >= 4) { [host, port] = parts; user = parts[2]; pass = parts.slice(3).join(':'); }
+    else [host, port] = parts;
+  }
+  if (!host || !/^\d{1,5}$/.test(port || '')) return null;
+  const proto: 'http' | 'socks5' = scheme.startsWith('socks') ? 'socks5' : 'http';
+  const auth = user ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@` : '';
+  const url = `${proto === 'socks5' ? 'socks5h' : 'http'}://${auth}${host}:${port}`;
+  return { addr: `res:${host}:${port}`, url, proto, latencyMs: 0, qualityGrade: 'R' };
+}
+
+function loadResidentialSlots(): void {
+  const lines: string[] = [];
+  for (const part of (process.env.RESIDENTIAL_PROXIES || '').split(/[\n,;]/)) lines.push(part);
+  try { lines.push(...fs.readFileSync(RESIDENTIAL_FILE, 'utf-8').split('\n')); } catch {}
+  const seen = new Set<string>();
+  residentialSlots = [];
+  for (const line of lines) {
+    const slot = parseResidentialProxy(line);
+    if (!slot || seen.has(slot.addr)) continue;
+    seen.add(slot.addr);
+    residentialSlots.push(slot);
+  }
+  console.log(`[Residential] ${residentialSlots.length} exits loaded${residentialSlots.length ? ': ' + residentialSlots.map(s => s.addr).join(', ') : ''}`);
+}
+
+// Least busy usable exit first; ties go to the one idle the longest, so load
+// spreads across every IP instead of exhausting one.
+function chooseResidentialSlot(model: string | undefined, tried: Set<string>): Slot | null {
+  let best: Slot | null = null;
+  for (const slot of residentialSlots) {
+    if (tried.has(slot.addr) || !isExitUsable(slot.addr, model)) continue;
+    if (!best) { best = slot; continue; }
+    const a = exitActiveRequests.get(slot.addr) || 0, b = exitActiveRequests.get(best.addr) || 0;
+    if (a < b || (a === b && (residentialLastUsed.get(slot.addr) || 0) < (residentialLastUsed.get(best.addr) || 0))) best = slot;
+  }
+  if (best) residentialLastUsed.set(best.addr, Date.now());
+  return best;
+}
+
+// Extra attempts per residential exit, so one burst can walk every IP before giving up.
+function maxRetries(): number {
+  return MAX_RETRIES + residentialSlots.length;
+}
+
+// When every exit is cooling down, waiting for the soonest one beats returning
+// an error. The client sees latency instead of a 429/503, up to this budget.
+const DISPATCH_PATIENCE_MS = parseInt(process.env.DISPATCH_PATIENCE_MS || '20000');
+
+function soonestExitRecoverySeconds(pool: KeySlotPool): number {
+  const addrs = [DIRECT_EXIT_ADDR, ...residentialSlots.map(s => s.addr), ...pool.slots.map(s => s.addr)];
+  if (warpSlot) addrs.push(warpSlot.addr);
+  let soonest = Infinity;
+  for (const addr of addrs) soonest = Math.min(soonest, exitCooldownRemainingSeconds(addr));
+  return Number.isFinite(soonest) ? soonest : 0;
+}
+
+async function dispatchPatiently(
+  path: string, method: string, headers: Record<string, string>,
+  body: string | undefined, pool: KeySlotPool, signal?: AbortSignal,
+): Promise<DispatchResult> {
+  const deadline = Date.now() + DISPATCH_PATIENCE_MS;
+  for (;;) {
+    const result = await dispatch(path, method, headers, body, pool, 0, new Set(), signal);
+    if (result.status !== 429 && result.status !== 503) return result;
+    const waitMs = Math.max(1000, soonestExitRecoverySeconds(pool) * 1000);
+    if (signal?.aborted || Date.now() + waitMs > deadline) return result;
+    console.log(`[Dispatch] all exits cooling down, holding request ${Math.round(waitMs / 1000)}s instead of returning ${result.status}`);
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(done, waitMs);
+      function done() { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); }
+      signal?.addEventListener('abort', done, { once: true });
+    });
+    if (signal?.aborted) return result;
+  }
+}
 let proxyFailCount = new Map<string, number>();
 
 // ── Two-level exit health ──
@@ -673,6 +806,8 @@ let proxyFailCount = new Map<string, number>();
 // cooldown, which honours Retry-After).
 const EXIT_COOLDOWN_BASE_MS = 30_000;
 const EXIT_COOLDOWN_MAX_MS = 10 * 60_000;
+const DIRECT_COOLDOWN_MAX_MS = 60_000;
+const RESIDENTIAL_FAIL_COOLDOWN_MS = 30_000;
 const MODEL_BAN_TTL_MS = 10 * 60_000;
 const MODEL_BAN_FAILS = 2;
 
@@ -736,9 +871,11 @@ function noteExitFailure(addr: string, status: number, model?: string): string {
   if (status === 429) {
     const s = exitState(addr);
     s.cooldownStreak = Math.min(s.cooldownStreak + 1, 4);
-    let delay = Math.min(EXIT_COOLDOWN_BASE_MS * Math.pow(2, s.cooldownStreak - 1), EXIT_COOLDOWN_MAX_MS);
+    // The server's own egress is the last resort, so it recovers on a short leash.
+    const cap = addr === DIRECT_EXIT_ADDR ? DIRECT_COOLDOWN_MAX_MS : EXIT_COOLDOWN_MAX_MS;
+    let delay = Math.min(EXIT_COOLDOWN_BASE_MS * Math.pow(2, s.cooldownStreak - 1), cap);
     const ra = Number(proxyRetryAfterMs.get(addr) || 0);
-    if (ra > delay) delay = Math.min(ra, EXIT_COOLDOWN_MAX_MS);
+    if (ra > delay) delay = Math.min(ra, cap);
     s.cooldownUntil = Date.now() + delay;
     proxyFailCount.delete(addr);
     scheduleProxyHealthSave();
@@ -758,6 +895,12 @@ function noteExitFailure(addr: string, status: number, model?: string): string {
       scheduleProxyHealthSave();
     }
     return `model-ban (${model || 'unknown'})`;
+  }
+
+  // Paid exits are never evicted: back off briefly and try again later.
+  if (isResidentialAddr(addr)) {
+    exitState(addr).cooldownUntil = Date.now() + RESIDENTIAL_FAIL_COOLDOWN_MS;
+    return `residential cooldown ${RESIDENTIAL_FAIL_COOLDOWN_MS / 1000}s`;
   }
 
   // Ambiguous: could be the proxy or the upstream. Count a strike so a
@@ -1966,6 +2109,7 @@ async function topUpKeySlotPool(pool: KeySlotPool, model?: string): Promise<numb
 }
 
 async function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): Promise<void> {
+  if (isResidentialAddr(failedAddr)) return;
   if (keySlotPools.get(pool.keyId) !== pool) return;
   const idx = pool.slots.findIndex(s => s.addr === failedAddr);
   if (idx >= 0) pool.slots.splice(idx, 1);
@@ -2575,7 +2719,8 @@ async function dispatch(
   if (body) { try { dispatchModel = (JSON.parse(body) as any)?.model; } catch {} }
 
   const session = headers['x-opencode-session'] || '';
-  let selectedSlot = choosePoolSlot(pool, dispatchModel, session, triedAddrs);
+  let selectedSlot = chooseResidentialSlot(dispatchModel, triedAddrs)
+    ?? choosePoolSlot(pool, dispatchModel, session, triedAddrs);
 
   // No available slot → fallback chain
   if (!selectedSlot) {
@@ -2705,7 +2850,7 @@ async function dispatch(
         const directRes = await dispatchDirect(path, method, headers, body, pool, signal);
         if (directRes.status >= 200 && directRes.status < 400) return directRes;
       }
-      if (retry < MAX_RETRIES) {
+      if (retry < maxRetries()) {
         return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs, signal);
       }
       console.log(`[Dispatch] All proxy retries exhausted for ${path}, attempting direct fallback...`);
@@ -2744,7 +2889,7 @@ async function dispatch(
         const directRes = await dispatchDirect(path, method, headers, body, pool, signal);
         if (directRes.status >= 200 && directRes.status < 400) return directRes;
       }
-      if (retry < MAX_RETRIES) {
+      if (retry < maxRetries()) {
         return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs, signal);
       }
       console.log(`[Dispatch] All proxy retries exhausted for ${path}, attempting direct fallback...`);
@@ -2763,7 +2908,7 @@ async function dispatch(
     console.log(`[Dispatch] ${selectedSlot.addr} transport exception -> ${verdict}`);
     replaceFailedSlot(pool, selectedSlot.addr);
     audit(502, Date.now() - start, selectedSlot.addr, path, JSON.stringify({ error: e.message }), pool.keyId);
-    if (retry < MAX_RETRIES) {
+    if (retry < maxRetries()) {
       return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs, signal);
     }
     console.log(`[Dispatch] All proxy attempts failed with exception, attempting direct fallback...`);
@@ -3799,6 +3944,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       candidatesCount: candidates.length,
       candidates: candidates.length,
       customSlotsCount: customSlots.length,
+      residential: { count: residentialSlots.length, coolingDown: residentialSlots.filter(s => exitCooldownRemainingSeconds(s.addr) > 0).length },
       totalApiKeys: Object.keys(apiKeys).length,
       timeouts: {
         nonStreamMs: TIMEOUT,
@@ -4408,7 +4554,11 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       if (substitutedFrom) {
         console.log(`[Models] ${substitutedFrom} is dead upstream, serving ${substitutedTo} instead`);
       }
-      const shaped = shapeAgentRequest(bodyStr as string, upstreamPath === '/v1/responses' ? 'responses' : 'chat');
+      // A real OpenCode client already sends an agent-shaped turn, and Zen now
+      // answers 403 if that body is rewritten, so it goes through untouched.
+      const shaped = isNativeOpenCodeRequest(nodeReq, bodyStr as string)
+        ? { body: bodyStr as string, callerWantsStream: true, reshaped: false }
+        : shapeAgentRequest(bodyStr as string, upstreamPath === '/v1/responses' ? 'responses' : 'chat');
       bodyStr = shaped.body;
       callerWantsStream = shaped.callerWantsStream;
       if (shaped.reshaped) {
@@ -4500,7 +4650,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       }
 
       clientSignal.throwIfAborted();
-      const result = await dispatch(upstreamPath + search, method, reqHeaders, bodyStr, pool, 0, new Set(), clientSignal);
+      const result = await dispatchPatiently(upstreamPath + search, method, reqHeaders, bodyStr, pool, clientSignal);
       if (clientSignal.aborted) {
         await result.stream?.cancel().catch(() => {});
         return;
@@ -4755,6 +4905,7 @@ async function main() {
 
   // Initialize custom proxies
   await initCustomSlots();
+  loadResidentialSlots();
 
   // Re-validate exits shortly after boot so the first allocation already knows
   // which proxies are alive instead of discovering it one request at a time.

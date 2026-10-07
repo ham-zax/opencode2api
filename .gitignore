@@ -30,3 +30,4 @@ backup_*/
 
 proxy_health_cache.json
 proxy_health_cache.json.tmp
+residential_proxies.txt
