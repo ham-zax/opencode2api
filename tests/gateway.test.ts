@@ -19,7 +19,7 @@ const definitions = new Bun.Transpiler({ loader: 'ts' }).transformSync(
 const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
 afterEach(() => { for (const timer of pendingTimers) clearTimeout(timer); pendingTimers.clear(); });
 
-function fixture(probeTimeout = 2500) {
+function fixture(probeTimeout = 2500, env: Record<string, string> = {}) {
   let now = 1_000_000;
   let requests = 0;
   let replyStatus = 200;
@@ -44,7 +44,7 @@ function fixture(probeTimeout = 2500) {
       return timer;
     }, clearTimeout, Date: Clock,
     console: { log() {}, warn() {}, error() {} },
-    process: { cwd: () => path.resolve(import.meta.dir, '..'), env: { PROXY_PROBE_TIMEOUT: String(probeTimeout) } },
+    process: { cwd: () => path.resolve(import.meta.dir, '..'), env: { PROXY_PROBE_TIMEOUT: String(probeTimeout), ...env } },
     path, crypto, isIP, buildZenCatalog, resolveCatalogModel, fs: { ...fs,
       writeFileSync(file: string, value: string) { stateFiles.set(file, value); },
       readFileSync(file: string, ...args: any[]) { return stateFiles.has(file) ? stateFiles.get(file) : (fs.readFileSync as any)(file, ...args); },
@@ -92,6 +92,8 @@ function fixture(probeTimeout = 2500) {
        setCustom(value) { customProxyItems = value; },
        setScreen(value) { coarseScreen = value; },
        setProbe(value) { probe = value; },
+       setAllocator(value) { allocateKeySlots = value; },
+       setHttpsRequest(value) { https.request = value; },
        setDispatch(value) { dispatch = value; },
        setKeys(value) { apiKeys = value; },
        getKeys() { return apiKeys; },
@@ -1168,6 +1170,48 @@ describe('stream admission and exit routing', () => {
     expect(g.destroyedRequests).toBe(1);
   });
 
+  test('a real socket can wait beyond its first-byte timeout for productive output', async () => {
+    const chunks = ': heartbeat\n\n' + first + final;
+    const worker = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(': heartbeat\n\n');
+      const timer = setTimeout(() => res.end(first + final), 160);
+      res.once('close', () => clearTimeout(timer));
+    });
+    await new Promise<void>(resolve => worker.listen(0, '127.0.0.1', resolve));
+    const port = (worker.address() as any).port;
+    const g = fixture(2500, { STREAM_FIRST_BYTE_TIMEOUT_MS: '50', STREAM_FIRST_EVENT_TIMEOUT_MS: '1000' });
+    g.setHttpsRequest((_url: any, options: any, callback: any) => http.request(`http://127.0.0.1:${port}/`, options, callback));
+    try {
+      const result = await g.doHttpsStream('/v1/chat/completions', 'POST', {}, body);
+      expect(result.status).toBe(200);
+      expect(await new Response(result.stream).text()).toBe(chunks);
+    } finally {
+      worker.closeAllConnections();
+      await new Promise<void>(resolve => worker.close(() => resolve()));
+    }
+  });
+
+  test('a real socket still enforces stream inactivity after productive output', async () => {
+    const worker = http.createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.write(first);
+    });
+    await new Promise<void>(resolve => worker.listen(0, '127.0.0.1', resolve));
+    const port = (worker.address() as any).port;
+    const g = fixture(2500, { STREAM_FIRST_BYTE_TIMEOUT_MS: '50', STREAM_FIRST_EVENT_TIMEOUT_MS: '1000', STREAM_IDLE_TIMEOUT_MS: '80' });
+    g.setHttpsRequest((_url: any, options: any, callback: any) => http.request(`http://127.0.0.1:${port}/`, options, callback));
+    try {
+      const result = await g.doHttpsStream('/v1/chat/completions', 'POST', {}, body);
+      await expect(new Response(result.stream).text()).rejects.toThrow('inactivity timeout');
+    } finally {
+      worker.closeAllConnections();
+      await new Promise<void>(resolve => worker.close(() => resolve()));
+    }
+  });
+
   test('heartbeats cannot extend the initial productive-event deadline', async () => {
     const g = fixture();
     g.echoStream([': keepalive\n\n'], true);
@@ -1407,8 +1451,38 @@ describe('stream admission and exit routing', () => {
     const burst = Array.from({ length: 24 }, () => g.getKeySlotPool('key'));
     const pools = await Promise.all([firstAllocation, ...burst]);
     expect(pools.every(p => p === pools[0])).toBe(true);
+    await g.topUpKeySlotPool(pools[0]);
     expect(pools[0].slots).toHaveLength(16);
     expect(new Set(pools[0].slots.map((s: any) => s.addr)).size).toBe(16);
     expect(g.activeRequests.key).toBe(25);
+  });
+
+  test('fresh allocation serves every waiting request before slow extra probes finish', async () => {
+    const g = fixture();
+    const items = Array.from({ length: 8 }, (_, i) => candidate(i + 1, i < 3 ? 'key' : null));
+    const p = pool(...items.slice(0, 3).map(c => c.address));
+    g.setCandidates(items);
+    for (const c of items) g.markValidated(c.address);
+    let ready!: () => void;
+    let finishProbes!: () => void;
+    const allocationGate = new Promise<void>(resolve => { ready = resolve; });
+    const probeGate = new Promise<void>(resolve => { finishProbes = resolve; });
+    g.setAllocator(async () => { await allocationGate; return p; });
+    g.setProbe(async () => { await probeGate; return { ok: true, latencyMs: 100 }; });
+    g.activeRequests.key = 1;
+    const firstAllocation = g.getKeySlotPool('key');
+    g.activeRequests.key = 6;
+    const waiting = [firstAllocation, ...Array.from({ length: 5 }, () => g.getKeySlotPool('key'))];
+    ready();
+    try {
+      const result = await Promise.race([
+        Promise.all(waiting), new Promise(resolve => setTimeout(() => resolve('blocked'), 50)),
+      ]);
+      expect(Array.isArray(result)).toBe(true);
+      expect((result as any[]).every(served => served === p)).toBe(true);
+      expect(p.slots).toHaveLength(3);
+    } finally { finishProbes(); }
+    await g.topUpKeySlotPool(p);
+    expect(p.slots).toHaveLength(6);
   });
 });

@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 import http from 'node:http';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { RuntimeSupervisor, chooseStandbyPort, type ManagedRuntime } from '../supervisor';
 
 async function freePort(): Promise<number> {
@@ -346,6 +349,108 @@ describe('runtime supervisor', () => {
     expect(supervisor.active).toBe(first);
     expect(created).toHaveLength(1);
   });
+
+  test('shutdown cancels readiness and waits for a late replacement to be stopped', async () => {
+    const { created, factory: inner } = crashableFactory();
+    let ready!: () => void;
+    let replacementSignal: AbortSignal | undefined;
+    const gate = new Promise<void>(resolve => { ready = resolve; });
+    const supervisor = new RuntimeSupervisor({ workerPorts: [13439, 13440], factory: async (port, generation, signal) => {
+      const runtime = await inner(port, generation);
+      if (created.length === 2) { replacementSignal = signal; await gate; }
+      return runtime;
+    } });
+    const first = await supervisor.start();
+    const replacement = supervisor.reload().then(() => null, error => error);
+    await waitFor(() => created.length === 2);
+    let shutdownComplete = false;
+    const shutdown = supervisor.shutdown().then(() => { shutdownComplete = true; });
+    try {
+      await waitFor(() => replacementSignal?.aborted === true);
+      expect(shutdownComplete).toBe(false);
+    } finally { ready(); }
+    await shutdown;
+    expect(created.every(worker => worker.stopped)).toBe(true);
+    expect((await replacement)?.message).toContain('shutting down');
+    expect(supervisor.active).toBe(first);
+    await expect(supervisor.reload()).rejects.toThrow('shutting down');
+    expect(created).toHaveLength(2);
+  });
+
+  test('shutdown also waits for an initial worker still becoming ready', async () => {
+    const { created, factory: inner } = crashableFactory();
+    let ready!: () => void;
+    let signal: AbortSignal | undefined;
+    const gate = new Promise<void>(resolve => { ready = resolve; });
+    const supervisor = new RuntimeSupervisor({ workerPorts: [13439, 13440], factory: async (port, generation, startupSignal) => {
+      signal = startupSignal;
+      const runtime = await inner(port, generation);
+      await gate;
+      return runtime;
+    } });
+    const starting = supervisor.start().then(() => null, error => error);
+    let shutdownComplete = false;
+    const shutdown = supervisor.shutdown().then(() => { shutdownComplete = true; });
+    try {
+      await waitFor(() => signal?.aborted === true);
+      expect(shutdownComplete).toBe(false);
+    } finally { ready(); }
+    await shutdown;
+    expect((await starting)?.message).toContain('shutting down');
+    expect(created[0]?.stopped).toBe(true);
+    expect(supervisor.active).toBeNull();
+    await expect(supervisor.start()).rejects.toThrow('shutting down');
+  });
+
+  test('SIGTERM during production replacement readiness leaves no worker processes', async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'opencode2api-shutdown-'));
+    const ports = [await freePort(), await freePort()];
+    const frontPort = await freePort();
+    const pidsFile = path.join(root, 'worker-pids.jsonl');
+    fs.writeFileSync(path.join(root, 'gate-docker.ts'), `
+      import fs from 'node:fs';
+      const port = Number(process.env.PORT);
+      fs.appendFileSync('worker-pids.jsonl', JSON.stringify({ pid: process.pid, port }) + '\\n');
+      Bun.serve({ hostname: '127.0.0.1', port, fetch() {
+        return Response.json({ ok: port !== Number(process.env.HOLD_READY_PORT),
+          runtime: { generation: process.env.RUNTIME_GENERATION } });
+      } });
+    `);
+    const parent = Bun.spawn([process.execPath, 'run', path.resolve(import.meta.dir, '../supervisor.ts')], {
+      cwd: root,
+      env: { ...process.env, BUN_BIN: process.execPath, PORT: String(frontPort), HOST: '127.0.0.1',
+        WORKER_PORTS: ports.join(','), HOLD_READY_PORT: String(ports[1]), WORKER_READY_TIMEOUT_MS: '60000' },
+      stdout: 'pipe', stderr: 'pipe',
+    });
+    const workers = () => fs.existsSync(pidsFile) ? fs.readFileSync(pidsFile, 'utf8').trim().split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await waitFor(() => workers().length === 1, 3000);
+      let active = false;
+      for (let attempt = 0; attempt < 100 && !active; attempt++) {
+        try { active = (await fetch(`http://127.0.0.1:${frontPort}/__supervisor/status`)).ok; } catch {}
+        if (!active) await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      expect(active).toBe(true);
+      parent.kill('SIGHUP');
+      await waitFor(() => workers().length === 2, 3000);
+      parent.kill('SIGTERM');
+      const exited = await Promise.race([parent.exited, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Supervisor did not finish shutdown')), 4000);
+      })]);
+      expect(exited).toBe(0);
+      for (const worker of workers()) {
+        let alive = false;
+        try { process.kill(worker.pid, 0); alive = true; } catch (error: any) { if (error.code !== 'ESRCH') throw error; }
+        expect(alive).toBe(false);
+      }
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (parent.exitCode == null) { parent.kill('SIGKILL'); await parent.exited; }
+      for (const worker of workers()) { try { process.kill(worker.pid, 'SIGKILL'); } catch {} }
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  }, 10000);
 
   test('a failing stop does not leave the old runtime stuck in the draining set', async () => {
     const { created, factory } = crashableFactory();

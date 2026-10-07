@@ -16,7 +16,8 @@ export interface ManagedRuntime {
   onExit?(listener: () => void): void;
 }
 
-export type RuntimeFactory = (port: number, generation: string) => Promise<ManagedRuntime>;
+/** Factories must stop their starting worker before rejecting on cancellation. */
+export type RuntimeFactory = (port: number, generation: string, signal?: AbortSignal) => Promise<ManagedRuntime>;
 
 export interface RuntimeSupervisorOptions {
   workerPorts: number[];
@@ -56,6 +57,8 @@ export class RuntimeSupervisor {
   private generationCounter = 0;
   private recovering = false;
   private stopping = false;
+  private readonly startupAbort = new AbortController();
+  private startPromise: Promise<ManagedRuntime> | null = null;
   private reloadPromise: Promise<ManagedRuntime> | null = null;
   active: ManagedRuntime | null = null;
   draining = new Set<ManagedRuntime>();
@@ -73,13 +76,24 @@ export class RuntimeSupervisor {
   }
 
   async start(): Promise<ManagedRuntime> {
+    if (this.stopping) throw new Error('Supervisor is shutting down');
     if (this.active) return this.active;
-    const runtime = await this.factory(
-      chooseStandbyPort(null, this.workerPorts, [...this.draining].map(draining => draining.port)),
-      this.nextGeneration(),
-    );
-    this.activate(runtime);
-    return runtime;
+    if (this.startPromise) return this.startPromise;
+    const work = (async () => {
+      const runtime = await this.factory(
+        chooseStandbyPort(null, this.workerPorts, [...this.draining].map(draining => draining.port)),
+        this.nextGeneration(), this.startupAbort.signal,
+      );
+      if (this.stopping) {
+        try { await runtime.stop(true); } finally { runtime.agent.destroy(); }
+        throw new Error('Supervisor is shutting down');
+      }
+      this.activate(runtime);
+      return runtime;
+    })();
+    this.startPromise = work;
+    try { return await work; }
+    finally { if (this.startPromise === work) this.startPromise = null; }
   }
 
   private activate(runtime: ManagedRuntime): void {
@@ -120,11 +134,19 @@ export class RuntimeSupervisor {
   /** Stops supervising: no recovery attempts, and all workers are stopped. */
   async shutdown(): Promise<void> {
     this.stopping = true;
+    this.startupAbort.abort(new Error('Supervisor is shutting down'));
+    const pending = [this.startPromise, this.reloadPromise].filter(Boolean) as Promise<ManagedRuntime>[];
     const runtimes = [this.active, ...this.draining].filter(Boolean) as ManagedRuntime[];
-    await Promise.all(runtimes.map(runtime => runtime.stop(true).catch(() => {})));
+    await Promise.all([
+      ...runtimes.map(async runtime => {
+        try { await runtime.stop(true); } catch {} finally { runtime.agent.destroy(); }
+      }),
+      ...pending.map(work => work.catch(() => {})),
+    ]);
   }
 
   async reload(): Promise<ManagedRuntime> {
+    if (this.stopping) throw new Error('Supervisor is shutting down');
     if (this.reloadPromise) return this.reloadPromise;
     this.reloadPromise = (async () => {
       const old = this.active;
@@ -133,9 +155,9 @@ export class RuntimeSupervisor {
         this.workerPorts,
         [...this.draining].map(runtime => runtime.port),
       );
-      const next = await this.factory(port, this.nextGeneration());
+      const next = await this.factory(port, this.nextGeneration(), this.startupAbort.signal);
       if (this.stopping) {
-        await next.stop(true).catch(() => {});
+        try { await next.stop(true); } finally { next.agent.destroy(); }
         throw new Error('Supervisor is shutting down');
       }
 
@@ -307,13 +329,17 @@ function hasExited(child: ChildProcess): boolean {
   return child.exitCode != null || child.signalCode != null;
 }
 
-async function waitForWorker(port: number, generation: string, child: ChildProcess): Promise<void> {
+async function waitForWorker(port: number, generation: string, child: ChildProcess, signal?: AbortSignal): Promise<void> {
   const deadline = Date.now() + WORKER_READY_TIMEOUT_MS;
   let lastError = 'worker not ready';
   while (Date.now() < deadline) {
+    signal?.throwIfAborted();
     if (hasExited(child)) throw new Error(`worker exited before readiness (code=${child.exitCode ?? child.signalCode})`);
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/api/status`, { signal: AbortSignal.timeout(2000) });
+      const timeout = AbortSignal.timeout(2000);
+      const response = await fetch(`http://127.0.0.1:${port}/api/status`, {
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      });
       if (response.ok) {
         const doc: any = await response.json();
         if (doc?.ok === true && doc?.runtime?.generation === generation) return;
@@ -322,6 +348,7 @@ async function waitForWorker(port: number, generation: string, child: ChildProce
         lastError = `HTTP ${response.status}`;
       }
     } catch (error: any) {
+      signal?.throwIfAborted();
       lastError = error?.message || String(error);
     }
     await sleep(500);
@@ -329,8 +356,22 @@ async function waitForWorker(port: number, generation: string, child: ChildProce
   throw new Error(`replacement worker failed readiness: ${lastError}`);
 }
 
+async function stopWorker(child: ChildProcess, force = false): Promise<void> {
+  if (hasExited(child)) return;
+  child.kill(force ? 'SIGKILL' : 'SIGTERM');
+  let deadline = Date.now() + 5000;
+  while (!hasExited(child) && Date.now() < deadline) await sleep(50);
+  if (!hasExited(child)) {
+    child.kill('SIGKILL');
+    deadline = Date.now() + 5000;
+    while (!hasExited(child) && Date.now() < deadline) await sleep(50);
+  }
+  if (!hasExited(child)) throw new Error(`Worker pid=${child.pid} did not exit after SIGKILL`);
+}
+
 function productionFactory(): RuntimeFactory {
-  return async (port, generation) => {
+  return async (port, generation, signal) => {
+    signal?.throwIfAborted();
     const child = spawn(BUN_BIN, ['run', 'gate-docker.ts'], {
       cwd: ROOT,
       env: {
@@ -344,13 +385,9 @@ function productionFactory(): RuntimeFactory {
     });
 
     try {
-      await waitForWorker(port, generation, child);
+      await waitForWorker(port, generation, child, signal);
     } catch (error) {
-      try { child.kill('SIGTERM'); } catch {}
-      // Let the failed worker release its port before a retry can reuse it.
-      const deadline = Date.now() + 5000;
-      while (!hasExited(child) && Date.now() < deadline) await sleep(50);
-      if (!hasExited(child)) try { child.kill('SIGKILL'); } catch {}
+      await stopWorker(child);
       throw error;
     }
 
@@ -364,11 +401,7 @@ function productionFactory(): RuntimeFactory {
         if (!hasExited(child)) child.kill('SIGUSR1');
       },
       async stop(force = false) {
-        if (hasExited(child)) return;
-        child.kill(force ? 'SIGKILL' : 'SIGTERM');
-        const deadline = Date.now() + 5000;
-        while (!hasExited(child) && Date.now() < deadline) await sleep(50);
-        if (!hasExited(child)) child.kill('SIGKILL');
+        await stopWorker(child, force);
       },
       onExit(listener) {
         if (hasExited(child)) queueMicrotask(listener);

@@ -2044,9 +2044,9 @@ async function getKeySlotPool(keyId: string): Promise<KeySlotPool | null> {
     const pool = await allocateKeySlots(keyId);
     if (pool) {
       keySlotPools.set(keyId, pool);
-      // Demand can rise while the initial probes are pending. All callers
-      // sharing this allocation must receive the replenished pool too.
-      if (pool.slots.length < desiredProxySlots(keyId)) await topUpKeySlotPool(pool);
+      // Serve the initial usable routes immediately. Extra demand that arrived
+      // during allocation can grow the shared pool behind these requests.
+      if (pool.slots.length < desiredProxySlots(keyId)) replenishInBackground(pool);
     }
     return pool;
   })();
@@ -2196,6 +2196,9 @@ function doHttpsStream(
     const req = https.request(`${UPSTREAM}${path}`, opts, res => {
       response = res;
       if (finished) { try { res.destroy(); } catch {} return; }
+      // Headers arrived: the absolute first-event deadline now bounds the
+      // prelude. A shorter socket inactivity timer must not cut that wait short.
+      try { req.setTimeout(0); } catch {}
       const resHeaders: Record<string, string> = {};
       for (const [k, v] of Object.entries(res.headers)) {
         if (v) resHeaders[k] = Array.isArray(v) ? v[0] : v;
