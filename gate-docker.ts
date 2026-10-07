@@ -71,6 +71,7 @@ const KEYS_FILE = path.join(DATA_DIR, 'keys.json');
 const SOURCES_FILE = path.join(DATA_DIR, 'sources.json');
 const CUSTOM_PROXIES_FILE = path.join(DATA_DIR, 'custom_proxies.json');
 const AUDIT_FILE = path.join(DATA_DIR, 'audit.jsonl');
+const PROXY_HEALTH_FILE = path.join(DATA_DIR, 'proxy_health_cache.json');
 
 // ═══════════════════════════════════════════════════════════
 //  Country Filters & Proxy Sources
@@ -660,6 +661,7 @@ function noteExitSuccess(addr: string, model?: string): void {
     const bans = exitModelBans.get(addr);
     bans?.delete(model);
   }
+  scheduleProxyHealthSave();
 }
 
 // Classify one upstream failure. Returns a short label for logging.
@@ -674,6 +676,7 @@ function noteExitFailure(addr: string, status: number, model?: string): string {
     if (ra > delay) delay = Math.min(ra, EXIT_COOLDOWN_MAX_MS);
     s.cooldownUntil = Date.now() + delay;
     proxyFailCount.delete(addr);
+    scheduleProxyHealthSave();
     return `cooldown ${Math.round(delay / 1000)}s`;
   }
 
@@ -687,6 +690,7 @@ function noteExitFailure(addr: string, status: number, model?: string): string {
       b.fails += 1;
       if (b.fails >= MODEL_BAN_FAILS) b.bannedUntil = Date.now() + MODEL_BAN_TTL_MS;
       bans.set(model, b);
+      scheduleProxyHealthSave();
     }
     return `model-ban (${model || 'unknown'})`;
   }
@@ -718,6 +722,74 @@ function rememberRetryAfter(addr: string, headers: Record<string, string> | unde
     if (!Number.isNaN(when)) {
       proxyRetryAfterMs.set(addr, Math.min(Math.max(0, when - Date.now()), EXIT_COOLDOWN_MAX_MS));
     }
+  }
+}
+
+let proxyHealthSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
+function saveProxyHealthState(): void {
+  const now = Date.now();
+  const validated = [...validatedExits.entries()]
+    .filter(([, at]) => now - at <= VALIDATED_TTL_MS)
+    .map(([addr, at]) => ({ addr, at }));
+  const cooldowns = [...exitHealth.entries()]
+    .filter(([, h]) => h.cooldownUntil > now)
+    .map(([addr, h]) => ({ addr, cooldownUntil: h.cooldownUntil, cooldownStreak: h.cooldownStreak }));
+  const modelBans: { addr: string; model: string; bannedUntil: number }[] = [];
+  for (const [addr, bans] of exitModelBans) {
+    for (const [model, ban] of bans) {
+      if (ban.bannedUntil > now) modelBans.push({ addr, model, bannedUntil: ban.bannedUntil });
+    }
+  }
+  try {
+    const tmp = `${PROXY_HEALTH_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify({ version: 1, upstream: UPSTREAM, savedAt: now, validated, cooldowns, modelBans }), 'utf-8');
+    fs.renameSync(tmp, PROXY_HEALTH_FILE);
+  } catch (e: any) {
+    console.warn(`[HealthCache] save failed: ${e?.message || e}`);
+  }
+}
+
+function scheduleProxyHealthSave(): void {
+  if (proxyHealthSaveTimer) return;
+  proxyHealthSaveTimer = setTimeout(() => {
+    proxyHealthSaveTimer = null;
+    saveProxyHealthState();
+  }, 250);
+  try { (proxyHealthSaveTimer as any).unref?.(); } catch {}
+}
+
+function loadProxyHealthState(): void {
+  try {
+    const doc = JSON.parse(fs.readFileSync(PROXY_HEALTH_FILE, 'utf-8'));
+    if (doc?.version !== 1 || doc?.upstream !== UPSTREAM) return;
+    const now = Date.now();
+    let restoredValidated = 0, restoredCooldowns = 0, restoredBans = 0;
+    for (const row of Array.isArray(doc.validated) ? doc.validated : []) {
+      if (typeof row?.addr !== 'string' || !Number.isFinite(row?.at)) continue;
+      if (now - row.at > VALIDATED_TTL_MS || row.at > now + 60_000) continue;
+      validatedExits.set(row.addr, row.at);
+      restoredValidated++;
+    }
+    for (const row of Array.isArray(doc.cooldowns) ? doc.cooldowns : []) {
+      if (typeof row?.addr !== 'string' || !Number.isFinite(row?.cooldownUntil) || row.cooldownUntil <= now) continue;
+      exitHealth.set(row.addr, {
+        fails: 0,
+        cooldownUntil: row.cooldownUntil,
+        cooldownStreak: Math.max(1, Math.min(4, Number(row.cooldownStreak) || 1)),
+      });
+      restoredCooldowns++;
+    }
+    for (const row of Array.isArray(doc.modelBans) ? doc.modelBans : []) {
+      if (typeof row?.addr !== 'string' || typeof row?.model !== 'string' || !Number.isFinite(row?.bannedUntil) || row.bannedUntil <= now) continue;
+      let bans = exitModelBans.get(row.addr);
+      if (!bans) { bans = new Map(); exitModelBans.set(row.addr, bans); }
+      bans.set(row.model, { fails: MODEL_BAN_FAILS, bannedUntil: row.bannedUntil });
+      restoredBans++;
+    }
+    console.log(`[HealthCache] restored validated=${restoredValidated} cooldowns=${restoredCooldowns} modelBans=${restoredBans}`);
+  } catch (e: any) {
+    if (e?.code !== 'ENOENT') console.warn(`[HealthCache] load failed: ${e?.message || e}`);
   }
 }
 
@@ -1222,7 +1294,7 @@ const POOL_TIERS: Record<PoolState, { admitMs: number; scrapeAll: boolean }> = {
 const VALIDATED_TTL_MS = 15 * 60_000;
 const validatedExits = new Map<string, number>();
 
-function markValidated(addr: string): void { validatedExits.set(addr, Date.now()); }
+function markValidated(addr: string): void { validatedExits.set(addr, Date.now()); scheduleProxyHealthSave(); }
 function isValidated(addr: string): boolean {
   const at = validatedExits.get(addr);
   if (at === undefined) return false;
@@ -4396,6 +4468,10 @@ async function main() {
 
   // Load historical audit logs (last 500 records)
   loadAuditLog();
+
+  // Restore only fresh validation/cooldown state. This prevents a restart from
+  // forgetting a recent 429 while still ageing stale proxy observations out.
+  loadProxyHealthState();
 
   // Load candidate proxies
   console.log('[Startup] Loading candidate proxies...');

@@ -73,7 +73,8 @@ function fixture(probeTimeout = 2500) {
     ({ coarseScreen, probe, backgroundProbeSweep, allocateKeySlots, loadCandidates,
        replaceFailedSlot, getKeySlotPool, releaseKeySlots,
        freeExitCount, currentDemandKeyCount, operationalPoolTarget, currentPoolState, poolGenerationConcurrencyCap, waitForPoolGenerationCapacity, markValidated, noteExitFailure,
-       isExitUsable, validatedExits, exitHealth, keySlotPools, coarseSeen,
+       isExitUsable, validatedExits, exitHealth, exitModelBans, keySlotPools, coarseSeen,
+       saveProxyHealthState, loadProxyHealthState,
        setCandidates(value) { candidates = value; },
        getCandidates() { return candidates; },
        setSources(value) { proxySources = value; },
@@ -102,6 +103,7 @@ function fixture(probeTimeout = 2500) {
     echo(value: any, ms = 1700, status = 200) { reply = value; latency = ms; replyStatus = status; },
     cache(doc: any) { stateFiles.set(path.resolve(import.meta.dir, '../models_cache.json'), JSON.stringify(doc)); },
     get cachedDoc() { const value = stateFiles.get(path.resolve(import.meta.dir, '../models_cache.json')); return value ? JSON.parse(value) : undefined; },
+    get healthDoc() { const value = stateFiles.get(path.resolve(import.meta.dir, '../proxy_health_cache.json')); return value ? JSON.parse(value) : undefined; },
     hang() { hang = true; },
     fireTimers(delay: number) {
       for (const entry of timers.filter(t => t.delay === delay)) {
@@ -140,6 +142,24 @@ describe('proxy pool regression checks', () => {
     expect(g.currentDemandKeyCount()).toBe(1);
     expect(g.operationalPoolTarget()).toBe(12);
     expect(g.currentPoolState()).toBe('healthy');
+  });
+
+  test('proxy health cache restores fresh validation and active cooldowns', () => {
+    const g = fixture();
+    const item = candidate(1);
+    g.setCandidates([item]);
+    g.markValidated(item.address);
+    g.noteExitFailure(item.address, 429, 'big-pickle');
+    g.saveProxyHealthState();
+    expect(g.healthDoc.validated).toHaveLength(1);
+    expect(g.healthDoc.cooldowns).toHaveLength(1);
+
+    g.validatedExits.clear();
+    g.exitHealth.clear();
+    g.exitModelBans.clear();
+    g.loadProxyHealthState();
+    expect(g.validatedExits.has(item.address)).toBe(true);
+    expect(g.exitHealth.get(item.address)?.cooldownUntil).toBeGreaterThan(g.now);
   });
 
   test('generation concurrency cap tightens as pool capacity falls', () => {
