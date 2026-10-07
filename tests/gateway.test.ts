@@ -511,6 +511,26 @@ describe('HTTP compatibility', () => {
     await expect(new Response(translated).text()).rejects.toThrow('terminal event');
   });
 
+  test('mid-stream transport failures become explicit SSE error events', async () => {
+    await withServer(async (base, g) => {
+      const broken = new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('data: {"id":"chatcmpl-test","choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}\n\n'));
+          controller.error(new Error('Upstream response aborted before completion'));
+        },
+      });
+      g.setDispatch(async () => ({ status: 200, stream: broken, streamHeaders: { 'content-type': 'text/event-stream' } }));
+      const response = await fetch(base + '/v1/chat/completions', { method: 'POST', headers, body: completion(true) });
+      expect(response.status).toBe(200);
+      const body = await response.text();
+      expect(body).toContain('event: error');
+      expect(body).toContain('"type":"upstream_stream_error"');
+      expect(body).toContain('"code":"upstream_stream_interrupted"');
+      expect(body).toContain('Upstream response aborted before completion');
+      expect(body).not.toContain('data: [DONE]');
+    });
+  });
+
   test('stream clients receive SSE through the terminal DONE frame', async () => {
     await withServer(async (base, g) => {
       g.setDispatch(async () => ({ status: 200, stream: replyStream(), streamHeaders: { 'content-type': 'text/event-stream', 'content-length': '99999' } }));

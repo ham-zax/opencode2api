@@ -4122,9 +4122,21 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
         } catch (err: any) {
           streamReadError = err instanceof Error ? err : new Error(String(err));
           console.warn(`[Dispatch] Stream read interrupted:`, streamReadError.message);
+          if (!clientClosed) {
+            const payload = JSON.stringify({
+              error: {
+                type: 'upstream_stream_error',
+                code: 'upstream_stream_interrupted',
+                message: streamReadError.message,
+              },
+            });
+            try {
+              nodeRes.write(`event: error\ndata: ${payload}\n\n`);
+              if (typeof (nodeRes as any).flush === 'function') (nodeRes as any).flush();
+            } catch {}
+          }
         } finally {
-          if (streamReadError && !clientClosed) nodeRes.destroy(streamReadError);
-          else nodeRes.end();
+          nodeRes.end();
           if (streamTokens > 0) recordKeyUsage(authKey, streamTokens);
         }
       } else {
