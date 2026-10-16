@@ -96,12 +96,11 @@ function fixture(probeTimeout = 2500, env: Record<string, string> = {}) {
        setHttpsRequest(value) { https.request = value; },
        setDispatch(value) { dispatch = value; },
        setDirectDispatch(value) { dispatchDirect = value; },
-       setResidential(value) { residentialSlots = value; },
        setKeys(value) { apiKeys = value; },
        getKeys() { return apiKeys; },
        setModels(value) { cachedModels = value; cachedModelsTime = Date.now(); },
        activeRequests, fetchModelsFromUpstream, ensureModelCatalog, loadModelCatalog,
-       normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, chatBodyToResponses, collectHeadersFromReq,
+       normalizeFreeModelAlias, isResponsesOnlyModel, shapeAgentRequest, isNativeOpenCodeRequest, parseResidentialProxy, chooseResidentialSlot, choosePoolSlot, isExitUsable, noteExitFailure, loadResidentialSlots, dispatchPatiently, setResidential(value) { residentialSlots = value; }, getResidential() { return residentialSlots; }, chatBodyToResponses, collectHeadersFromReq,
        declaredToolNames, authorizedToolNames, requestDeclaresTools, guardToolPolicyStream, monitorUpstreamSse, collectChatStream, responsesSseToChatSse, dispatchDirect, sendJson, sendJsonWithHeaders,
        probeFreeModel, verifyFreeModels, freeModelHealth, workingFreeModelIds, hasModelOutput,
        catalogStatus,
@@ -582,6 +581,7 @@ describe('shared key usage persistence', () => {
 
 describe('HTTP compatibility', () => {
   async function withServer(run: (base: string, g: any) => Promise<void>) {
+    // Patience is covered by its own test; here a stubbed 429 must surface at once.
     const g = fixture(2500, { DISPATCH_PATIENCE_MS: '0' });
     g.setKeys({ 'test-key': { enabled: true, expiresAt: 0, maxRequests: 0, maxConcurrency: 0,
       requestCount: 0, totalRequests: 0, totalTokens: 0 } });
@@ -1193,6 +1193,90 @@ describe('Zen discovery and health', () => {
     expect([...g.authorizedToolNames(JSON.stringify({ tool_choice: { type: 'function', function: { name: 'read' } } }))]).toEqual(['read']);
     expect(g.requestDeclaresTools(JSON.stringify({ tools: [] }))).toBe(false);
     expect(g.requestDeclaresTools(JSON.stringify({ tools: [{ type: 'function', function: { name: 'read' } }] }))).toBe(true);
+  });
+
+  test('genuine OpenCode requests are recognised and forwarded untouched', () => {
+    const g = fixture();
+    const native = {
+      headers: { 'user-agent': 'opencode/latest/2.0.22/cli', 'x-opencode-session': 'ses_ee76e2991ffe37NX4NsYPGwXoI' },
+    } as any;
+    const body = JSON.stringify({ model: 'big-pickle', messages: [{ role: 'user', content: 'hi' }], stream: true });
+    expect(g.isNativeOpenCodeRequest(native, body)).toBe(true);
+    // Any one missing signal falls back to the shaping path.
+    expect(g.isNativeOpenCodeRequest({ headers: { ...native.headers, 'user-agent': 'curl/8' } }, body)).toBe(false);
+    expect(g.isNativeOpenCodeRequest({ headers: { ...native.headers, 'x-opencode-session': 'ses_short' } }, body)).toBe(false);
+    expect(g.isNativeOpenCodeRequest(native, JSON.stringify({ model: 'big-pickle', messages: [] }))).toBe(false);
+    expect(g.isNativeOpenCodeRequest(native, 'not json')).toBe(false);
+  });
+
+  test('residential proxies parse from every common format and never expose credentials in the label', () => {
+    const g = fixture();
+    const a = g.parseResidentialProxy('http://us er:p@ss:w0rd@1.2.3.4:8000');
+    expect(a.addr).toBe('res:1.2.3.4:8000');
+    expect(a.url).toBe('http://us%20er:p%40ss%3Aw0rd@1.2.3.4:8000');
+    expect(a.url).toContain('p%40ss');
+    const b = g.parseResidentialProxy('5.6.7.8:9000:bob:se:cret');
+    expect(b.url).toBe('http://bob:se%3Acret@5.6.7.8:9000');
+    expect(g.parseResidentialProxy('socks5://bob:pw@9.9.9.9:1080').url).toBe('socks5h://bob:pw@9.9.9.9:1080');
+    expect(g.parseResidentialProxy('9.9.9.9:1080').url).toBe('http://9.9.9.9:1080');
+    expect(g.parseResidentialProxy('ftp://1.1.1.1:21')).toBeNull();
+    expect(g.parseResidentialProxy('# comment')).toBeNull();
+    expect(g.parseResidentialProxy('nonsense')).toBeNull();
+    expect(a.addr).not.toContain('er:');
+  });
+
+  test('residential exits rotate evenly, back off on 429 and are never evicted', () => {
+    const g = fixture();
+    const env = ['1.1.1.1:80', '2.2.2.2:80', '3.3.3.3:80'].map(x => g.parseResidentialProxy(x));
+    g.setResidential(env);
+    const tried = new Set<string>();
+    const picks = [0, 1, 2].map(() => g.chooseResidentialSlot('big-pickle', tried).addr);
+    expect(new Set(picks).size).toBe(3);
+
+    g.noteExitFailure(env[0].addr, 429, 'big-pickle');
+    expect(g.isExitUsable(env[0].addr, 'big-pickle')).toBe(false);
+    expect(g.chooseResidentialSlot('big-pickle', new Set([env[1].addr, env[2].addr]))).toBeNull();
+
+    // A transport failure is a short cooldown, never an eviction.
+    for (let i = 0; i < 10; i++) expect(g.noteExitFailure(env[1].addr, 502, 'big-pickle')).toContain('residential cooldown');
+    expect(g.noteExitFailure(env[1].addr, 502, 'big-pickle')).not.toContain('evicted');
+  });
+
+  test('a public exit is retired after its request budget and returns when the window ends', () => {
+    const g = fixture(2500, { PUBLIC_EXIT_BUDGET: '3', PUBLIC_EXIT_WINDOW_MS: '60000' });
+    const slot = (addr: string) => ({ addr, url: `http://${addr}`, proto: 'http', latencyMs: 10, qualityGrade: 'A' });
+    const pool = { keyId: 'k', slots: [slot('9.9.9.1:80'), slot('9.9.9.2:80')], rrCursor: 0, lastUsedAt: 0 };
+    const used: string[] = [];
+    for (let i = 0; i < 6; i++) used.push(g.choosePoolSlot(pool, 'big-pickle', '', new Set()).addr);
+    // Each exit carried exactly its budget, so both are now retired.
+    expect(used.filter(a => a === '9.9.9.1:80').length).toBe(3);
+    expect(used.filter(a => a === '9.9.9.2:80').length).toBe(3);
+    expect(g.isExitUsable('9.9.9.1:80', 'big-pickle')).toBe(false);
+    expect(g.choosePoolSlot(pool, 'big-pickle', '', new Set())).toBeNull();
+
+    g.advance(60_001);
+    expect(g.isExitUsable('9.9.9.1:80', 'big-pickle')).toBe(true);
+  });
+
+  test('residential exits are exempt from the public request budget', () => {
+    const g = fixture(2500, { PUBLIC_EXIT_BUDGET: '2' });
+    const [r] = [g.parseResidentialProxy('1.1.1.1:80')];
+    g.setResidential([r]);
+    for (let i = 0; i < 5; i++) expect(g.chooseResidentialSlot('big-pickle', new Set()).addr).toBe(r.addr);
+    expect(g.isExitUsable(r.addr, 'big-pickle')).toBe(true);
+  });
+
+  test('a request is held for the soonest exit instead of returning 429', async () => {
+    const g = fixture(2500, { DISPATCH_PATIENCE_MS: '20000' });
+    const calls: number[] = [];
+    g.setDispatch(async () => {
+      calls.push(calls.length);
+      return calls.length < 2 ? { status: 429, body: '{}' } : { status: 200, body: 'ok' };
+    });
+    const pool = { keyId: 'k', slots: [], rrCursor: 0, lastUsedAt: 0 };
+    const result = await g.dispatchPatiently('/v1/chat/completions', 'POST', {}, '{}', pool);
+    expect(result.status).toBe(200);
+    expect(calls.length).toBe(2);
   });
 
   test('agent shaping preserves client tools and appends missing core tools', () => {
