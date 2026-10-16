@@ -261,6 +261,18 @@ const DEFAULT_SOURCES = [
     type: 'json' as const,
     parser: geonodeParser,
   },
+  {
+    name: 'iplocate-socks5',
+    url: 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/socks5.txt',
+    type: 'text' as const,
+    parser: textParser('socks5'),
+  },
+  {
+    name: 'iplocate-http',
+    url: 'https://raw.githubusercontent.com/iplocate/free-proxy-list/main/protocols/http.txt',
+    type: 'text' as const,
+    parser: textParser('http'),
+  },
 ];
 
 let proxySources: typeof DEFAULT_SOURCES = [];
@@ -330,11 +342,16 @@ let runtimeDraining = false;
 const MAX_RETRIES = 3;
 const TIMEOUT = 15000;
 const STREAM_FIRST_BYTE_TIMEOUT_MS = parseInt(process.env.STREAM_FIRST_BYTE_TIMEOUT_MS || '30000');
+// Reasoning models may emit only keep-alives for a while before the first token,
+// so the productive-event deadline is deliberately looser than the first-byte one.
+const STREAM_FIRST_EVENT_TIMEOUT_MS = Math.max(STREAM_FIRST_BYTE_TIMEOUT_MS, parseInt(process.env.STREAM_FIRST_EVENT_TIMEOUT_MS || '120000') || 120000);
 const STREAM_IDLE_TIMEOUT_MS = parseInt(process.env.STREAM_IDLE_TIMEOUT_MS || '600000');
 const PROXY_CONNECT_TIMEOUT_MS = parseInt(process.env.PROXY_CONNECT_TIMEOUT_MS || '15000');
 
 const MAX_ACTIVE_KEYS = 20;
 const SLOTS_PER_KEY = 3;
+// This bounds retained proxy routes, never the number of admitted requests.
+const MAX_PROXY_SLOTS_PER_KEY = Math.max(SLOTS_PER_KEY, parseInt(process.env.MAX_PROXY_SLOTS_PER_KEY || '16') || 16);
 const POOL_CLEANUP_MS = 60000;
 const KEY_IDLE_RELEASE_MS = 600000;
 
@@ -401,8 +418,11 @@ let modelsVerified = false;
 // used from within OpenCode"), which is why testing them one at a time is
 // misleading — a fix for one looks like it did nothing.
 //
-// Tool count, system-prompt size, tool_choice and max_tokens were all ablated
-// and are irrelevant; five stub tool definitions are enough.
+// Re-checked against Zen with OpenCode 2.0.22: those two conditions are no
+// longer sufficient for a non-native body (stub tools and an injected system
+// message also 403), but a genuine OpenCode body is accepted verbatim. Native
+// clients are therefore forwarded untouched (isNativeOpenCodeRequest) and the
+// shaping below is a best-effort path for everything else.
 //
 // Set FREE_TIER_AGENT_SHAPE=0 to turn this off and send bodies verbatim.
 const FREE_TIER_AGENT_SHAPE = (process.env.FREE_TIER_AGENT_SHAPE || '1') !== '0';
@@ -430,6 +450,18 @@ function canonicalSessionID(signal: string): string {
     acc /= 62n;
   }
   return `ses_${timePart}${tail}`;
+}
+
+// True for a request that came from a genuine OpenCode client: opencode user
+// agent, a canonical session id it generated itself, and an already-streaming
+// body. Verified against Zen: replaying such a body verbatim returns 200, while
+// the same body with injected stub tools / system message returns 403.
+function isNativeOpenCodeRequest(nodeReq: http.IncomingMessage, bodyStr: string): boolean {
+  if (!FREE_TIER_AGENT_SHAPE) return false;
+  const ua = String(nodeReq.headers['user-agent'] || '');
+  const session = String(nodeReq.headers['x-opencode-session'] || '');
+  if (!ua.startsWith('opencode/') || !CANONICAL_SESSION_RE.test(session)) return false;
+  try { return (JSON.parse(bodyStr) as any)?.stream === true; } catch { return false; }
 }
 
 function freeTierStubToolset(names: string[]): any[] {
@@ -620,10 +652,11 @@ function isTransientStatus(status: number): boolean {
 }
 
 // A deterministic rejection the same request will hit again next time: the
-// free tier is locked to the OpenCode client (403), or the provider does not
+// provider rejects access (401/403), or the provider does not
 // offer the model (400/404/422). Retrying cannot help, so these go straight to
 // dead on the first observation instead of burning three verification passes
 // (90 minutes at the default interval) while callers keep getting raw errors.
+// FreeTierError from a synthetic probe is client-context evidence only.
 function isHardFailure(status: number): boolean {
   return status === 400 || status === 401 || status === 403 || status === 404 || status === 422;
 }
@@ -638,7 +671,7 @@ const MODEL_CATALOG_TTL_MS = 5 * 60 * 1000;
 const MODEL_CATALOG_MAX_STALE_MS = 24 * 60 * 60 * 1000;
 const MODEL_CATALOG_RETRY_MS = 30 * 1000;
 const MODEL_CATALOG_FILE = path.join(DATA_DIR, 'models_cache.json');
-const OPENCODE_USER_AGENT = process.env.OPENCODE_USER_AGENT || 'opencode/latest/2.0.21/cli';
+const OPENCODE_USER_AGENT = process.env.OPENCODE_USER_AGENT || 'opencode/latest/2.0.22/cli';
 let catalogRefresh: Promise<ZenModel[]> | null = null;
 let catalogLastAttempt = 0;
 let catalogLastError = '';
@@ -649,6 +682,112 @@ const API_KEY = process.env.API_KEY || 'admin123';
 let candidates: CandidateItem[] = [];
 let customSlots: Slot[] = [];
 const PROXY_MAX_FAILS = 3;
+
+// ── Residential tier ──
+// Paid residential exits are tried before any public proxy. Zen limits per IP,
+// and these IPs are not shared with other scrapers, so they rarely start out
+// rate-limited. Credentials stay in `url`; `addr` is a label safe to log.
+const RESIDENTIAL_FILE = path.join(DATA_DIR, 'residential_proxies.txt');
+let residentialSlots: Slot[] = [];
+const residentialLastUsed = new Map<string, number>();
+
+function isResidentialAddr(addr: string): boolean {
+  return addr.startsWith('res:');
+}
+
+// Accepts `scheme://user:pass@host:port`, `user:pass@host:port`,
+// `host:port:user:pass` and bare `host:port`. http/https -> http, socks5/socks5h -> socks5.
+function parseResidentialProxy(line: string): Slot | null {
+  const raw = line.trim();
+  if (!raw || raw.startsWith('#')) return null;
+  const scheme = /^([a-z0-9]+):\/\//i.exec(raw)?.[1]?.toLowerCase() || 'http';
+  if (!['http', 'https', 'socks5', 'socks5h'].includes(scheme)) return null;
+  const rest = raw.replace(/^[a-z0-9]+:\/\//i, '');
+  let host: string, port: string, user = '', pass = '';
+  const at = rest.lastIndexOf('@');
+  if (at >= 0) {
+    const cred = rest.slice(0, at);
+    const colon = cred.indexOf(':');
+    user = colon >= 0 ? cred.slice(0, colon) : cred;
+    pass = colon >= 0 ? cred.slice(colon + 1) : '';
+    [host, port] = rest.slice(at + 1).split(':');
+  } else {
+    const parts = rest.split(':');
+    if (parts.length >= 4) { [host, port] = parts; user = parts[2]; pass = parts.slice(3).join(':'); }
+    else [host, port] = parts;
+  }
+  if (!host || !/^\d{1,5}$/.test(port || '')) return null;
+  const proto: 'http' | 'socks5' = scheme.startsWith('socks') ? 'socks5' : 'http';
+  const auth = user ? `${encodeURIComponent(user)}:${encodeURIComponent(pass)}@` : '';
+  const url = `${proto === 'socks5' ? 'socks5h' : 'http'}://${auth}${host}:${port}`;
+  return { addr: `res:${host}:${port}`, url, proto, latencyMs: 0, qualityGrade: 'R' };
+}
+
+function loadResidentialSlots(): void {
+  const lines: string[] = [];
+  for (const part of (process.env.RESIDENTIAL_PROXIES || '').split(/[\n,;]/)) lines.push(part);
+  try { lines.push(...fs.readFileSync(RESIDENTIAL_FILE, 'utf-8').split('\n')); } catch {}
+  const seen = new Set<string>();
+  residentialSlots = [];
+  for (const line of lines) {
+    const slot = parseResidentialProxy(line);
+    if (!slot || seen.has(slot.addr)) continue;
+    seen.add(slot.addr);
+    residentialSlots.push(slot);
+  }
+  console.log(`[Residential] ${residentialSlots.length} exits loaded${residentialSlots.length ? ': ' + residentialSlots.map(s => s.addr).join(', ') : ''}`);
+}
+
+// Least busy usable exit first; ties go to the one idle the longest, so load
+// spreads across every IP instead of exhausting one.
+function chooseResidentialSlot(model: string | undefined, tried: Set<string>): Slot | null {
+  let best: Slot | null = null;
+  for (const slot of residentialSlots) {
+    if (tried.has(slot.addr) || !isExitUsable(slot.addr, model)) continue;
+    if (!best) { best = slot; continue; }
+    const a = exitActiveRequests.get(slot.addr) || 0, b = exitActiveRequests.get(best.addr) || 0;
+    if (a < b || (a === b && (residentialLastUsed.get(slot.addr) || 0) < (residentialLastUsed.get(best.addr) || 0))) best = slot;
+  }
+  if (best) residentialLastUsed.set(best.addr, Date.now());
+  return best;
+}
+
+// Extra attempts per residential exit, so one burst can walk every IP before giving up.
+function maxRetries(): number {
+  return MAX_RETRIES + residentialSlots.length;
+}
+
+// When every exit is cooling down, waiting for the soonest one beats returning
+// an error. The client sees latency instead of a 429/503, up to this budget.
+const DISPATCH_PATIENCE_MS = parseInt(process.env.DISPATCH_PATIENCE_MS || '20000');
+
+function soonestExitRecoverySeconds(pool: KeySlotPool): number {
+  const addrs = [DIRECT_EXIT_ADDR, ...residentialSlots.map(s => s.addr), ...pool.slots.map(s => s.addr)];
+  if (warpSlot) addrs.push(warpSlot.addr);
+  let soonest = Infinity;
+  for (const addr of addrs) soonest = Math.min(soonest, exitCooldownRemainingSeconds(addr));
+  return Number.isFinite(soonest) ? soonest : 0;
+}
+
+async function dispatchPatiently(
+  path: string, method: string, headers: Record<string, string>,
+  body: string | undefined, pool: KeySlotPool, signal?: AbortSignal,
+): Promise<DispatchResult> {
+  const deadline = Date.now() + DISPATCH_PATIENCE_MS;
+  for (;;) {
+    const result = await dispatch(path, method, headers, body, pool, 0, new Set(), signal);
+    if (result.status !== 429 && result.status !== 503) return result;
+    const waitMs = Math.max(1000, soonestExitRecoverySeconds(pool) * 1000);
+    if (signal?.aborted || Date.now() + waitMs > deadline) return result;
+    console.log(`[Dispatch] all exits cooling down, holding request ${Math.round(waitMs / 1000)}s instead of returning ${result.status}`);
+    await new Promise<void>(resolve => {
+      const timer = setTimeout(done, waitMs);
+      function done() { clearTimeout(timer); signal?.removeEventListener('abort', done); resolve(); }
+      signal?.addEventListener('abort', done, { once: true });
+    });
+    if (signal?.aborted) return result;
+  }
+}
 let proxyFailCount = new Map<string, number>();
 
 // ── Two-level exit health ──
@@ -668,6 +807,8 @@ let proxyFailCount = new Map<string, number>();
 // cooldown, which honours Retry-After).
 const EXIT_COOLDOWN_BASE_MS = 30_000;
 const EXIT_COOLDOWN_MAX_MS = 10 * 60_000;
+const DIRECT_COOLDOWN_MAX_MS = 60_000;
+const RESIDENTIAL_FAIL_COOLDOWN_MS = 30_000;
 const MODEL_BAN_TTL_MS = 10 * 60_000;
 const MODEL_BAN_FAILS = 2;
 
@@ -697,9 +838,38 @@ function exitState(addr: string): ExitHealth {
   return s;
 }
 
+// Public-pool rotation: a shared public exit is retired once it has carried
+// PUBLIC_EXIT_BUDGET requests inside PUBLIC_EXIT_WINDOW_MS, before Zen's per-IP
+// limit does it for us. Residential, WARP, direct and custom exits are exempt.
+const PUBLIC_EXIT_BUDGET = parseInt(process.env.PUBLIC_EXIT_BUDGET || '60');
+const PUBLIC_EXIT_WINDOW_MS = parseInt(process.env.PUBLIC_EXIT_WINDOW_MS || String(60 * 60_000));
+const exitUseWindow = new Map<string, { start: number; count: number }>();
+
+function isBudgetedExit(addr: string): boolean {
+  return PUBLIC_EXIT_BUDGET > 0 && !isResidentialAddr(addr) && addr !== DIRECT_EXIT_ADDR
+    && addr !== getWarpAddr() && !customSlots.some(cs => cs.addr === addr);
+}
+
+function exitBudgetExhausted(addr: string): boolean {
+  const w = exitUseWindow.get(addr);
+  if (!w) return false;
+  if (Date.now() - w.start >= PUBLIC_EXIT_WINDOW_MS) { exitUseWindow.delete(addr); return false; }
+  return w.count >= PUBLIC_EXIT_BUDGET;
+}
+
+function noteExitUse(addr: string): void {
+  if (!isBudgetedExit(addr)) return;
+  const now = Date.now();
+  let w = exitUseWindow.get(addr);
+  if (!w || now - w.start >= PUBLIC_EXIT_WINDOW_MS) { w = { start: now, count: 0 }; exitUseWindow.set(addr, w); }
+  w.count += 1;
+  if (w.count === PUBLIC_EXIT_BUDGET) console.log(`[Rotate] ${addr} reached ${PUBLIC_EXIT_BUDGET} requests, retiring for ${Math.round(PUBLIC_EXIT_WINDOW_MS / 60_000)}m`);
+}
+
 function isExitUsable(addr: string, model: string | undefined): boolean {
   const s = exitHealth.get(addr);
   if (s && s.cooldownUntil > Date.now()) return false;
+  if (exitBudgetExhausted(addr)) return false;
   if (model) {
     const bans = exitModelBans.get(addr);
     const b = bans?.get(model);
@@ -711,11 +881,15 @@ function isExitUsable(addr: string, model: string | undefined): boolean {
 function noteExitSuccess(addr: string, model?: string): void {
   const s = exitState(addr);
   s.fails = 0;
-  s.cooldownUntil = 0;
-  s.cooldownStreak = 0;
+  // Another concurrent request may have received a newer rate limit while
+  // this successful stream was running. Honour that deadline until it expires.
+  if (s.cooldownUntil <= Date.now()) {
+    s.cooldownUntil = 0;
+    s.cooldownStreak = 0;
+  }
   if (model) {
     const bans = exitModelBans.get(addr);
-    bans?.delete(model);
+    if ((bans?.get(model)?.bannedUntil || 0) <= Date.now()) bans?.delete(model);
   }
   scheduleProxyHealthSave();
 }
@@ -727,9 +901,11 @@ function noteExitFailure(addr: string, status: number, model?: string): string {
   if (status === 429) {
     const s = exitState(addr);
     s.cooldownStreak = Math.min(s.cooldownStreak + 1, 4);
-    let delay = Math.min(EXIT_COOLDOWN_BASE_MS * Math.pow(2, s.cooldownStreak - 1), EXIT_COOLDOWN_MAX_MS);
+    // The preferred direct route recovers on a short leash.
+    const cap = addr === DIRECT_EXIT_ADDR ? DIRECT_COOLDOWN_MAX_MS : EXIT_COOLDOWN_MAX_MS;
+    let delay = Math.min(EXIT_COOLDOWN_BASE_MS * Math.pow(2, s.cooldownStreak - 1), cap);
     const ra = Number(proxyRetryAfterMs.get(addr) || 0);
-    if (ra > delay) delay = Math.min(ra, EXIT_COOLDOWN_MAX_MS);
+    if (ra > delay) delay = Math.min(ra, cap);
     s.cooldownUntil = Date.now() + delay;
     proxyFailCount.delete(addr);
     scheduleProxyHealthSave();
@@ -749,6 +925,12 @@ function noteExitFailure(addr: string, status: number, model?: string): string {
       scheduleProxyHealthSave();
     }
     return `model-ban (${model || 'unknown'})`;
+  }
+
+  // Paid exits are never evicted: back off briefly and try again later.
+  if (isResidentialAddr(addr)) {
+    exitState(addr).cooldownUntil = Date.now() + RESIDENTIAL_FAIL_COOLDOWN_MS;
+    return `residential cooldown ${RESIDENTIAL_FAIL_COOLDOWN_MS / 1000}s`;
   }
 
   // Ambiguous: could be the proxy or the upstream. Count a strike so a
@@ -919,12 +1101,44 @@ function loadKeys() {
   }
 }
 
+// Usage counters are additive: during a supervised reload two generations
+// serve the same keys.json, so each process remembers what it added since its
+// last save and merges that onto whatever is on disk instead of overwriting it.
+interface KeyUsageDelta { totalRequests: number; requestCount: number; totalTokens: number; lastUsedAt: number }
+const keyUsageDeltas = new Map<string, KeyUsageDelta>();
+
+function noteKeyUsage(key: string, patch: Partial<KeyUsageDelta>): void {
+  const delta = keyUsageDeltas.get(key) || { totalRequests: 0, requestCount: 0, totalTokens: 0, lastUsedAt: 0 };
+  delta.totalRequests += patch.totalRequests || 0;
+  delta.requestCount += patch.requestCount || 0;
+  delta.totalTokens += patch.totalTokens || 0;
+  delta.lastUsedAt = Math.max(delta.lastUsedAt, patch.lastUsedAt || 0);
+  keyUsageDeltas.set(key, delta);
+}
+
+function mergeKeyCounters(target: ApiKeyRecord, onDisk: ApiKeyRecord, delta: KeyUsageDelta | undefined): void {
+  target.totalRequests = (onDisk.totalRequests || 0) + (delta?.totalRequests || 0);
+  target.requestCount = (onDisk.requestCount || 0) + (delta?.requestCount || 0);
+  target.totalTokens = (onDisk.totalTokens || 0) + (delta?.totalTokens || 0);
+  target.lastUsedAt = Math.max(onDisk.lastUsedAt || 0, delta?.lastUsedAt || 0, target.lastUsedAt || 0);
+}
+
 function saveKeys() {
-  if (runtimeDraining) return;
   try {
+    let onDisk: Record<string, ApiKeyRecord> = {};
+    try { onDisk = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf-8')); } catch {}
+    // A draining generation must not resurrect or edit keys; it only adds its
+    // remaining usage to records that still exist on disk.
+    if (runtimeDraining && !Object.keys(onDisk).length) return;
+    const next = runtimeDraining ? onDisk : apiKeys;
+    for (const [key, record] of Object.entries(next)) {
+      const existing = onDisk[key];
+      if (existing) mergeKeyCounters(record, existing, keyUsageDeltas.get(key));
+    }
     const tmp = `${KEYS_FILE}.${process.pid}.tmp`;
-    fs.writeFileSync(tmp, JSON.stringify(apiKeys, null, 2), 'utf-8');
+    fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf-8');
     fs.renameSync(tmp, KEYS_FILE);
+    keyUsageDeltas.clear();
   } catch (e: any) {
     console.error(`[Keys] Save failed: ${e.message}`);
   }
@@ -954,6 +1168,7 @@ function recordKeyRequest(key: string) {
   record.lastUsedAt = Date.now();
   record.totalRequests++;
   record.requestCount++;
+  noteKeyUsage(key, { totalRequests: 1, requestCount: 1, lastUsedAt: record.lastUsedAt });
   saveKeys();
 }
 
@@ -962,6 +1177,7 @@ function recordKeyUsage(key: string, tokens: number) {
   if (record) {
     record.lastUsedAt = Date.now();
     record.totalTokens += tokens;
+    noteKeyUsage(key, { totalTokens: tokens, lastUsedAt: record.lastUsedAt });
     saveKeys();
   }
 }
@@ -1337,8 +1553,6 @@ type PoolState = 'healthy' | 'watch' | 'constrained' | 'degraded';
 // Free (unlocked) exits needed to serve every key without contention.
 const POOL_CAPACITY_TARGET = Math.max(60, SLOTS_PER_KEY * MAX_ACTIVE_KEYS * 2);
 const POOL_MIN_OPERATIONAL_TARGET = Math.max(SLOTS_PER_KEY * 2, parseInt(process.env.POOL_MIN_OPERATIONAL_TARGET || '12'));
-const POOL_BACKPRESSURE_WAIT_MS = parseInt(process.env.POOL_BACKPRESSURE_WAIT_MS || '30000');
-const POOL_BACKPRESSURE_POLL_MS = Math.max(25, parseInt(process.env.POOL_BACKPRESSURE_POLL_MS || '100'));
 const POOL_TIERS: Record<PoolState, { admitMs: number; scrapeAll: boolean }> = {
   healthy:     { admitMs: 1200, scrapeAll: false },
   watch:       { admitMs: 2000, scrapeAll: false },
@@ -1379,7 +1593,9 @@ function currentDemandKeyCount(): number {
 }
 
 function operationalPoolTarget(): number {
-  return Math.max(POOL_MIN_OPERATIONAL_TARGET, SLOTS_PER_KEY * currentDemandKeyCount() * 2);
+  const trafficTarget = Object.entries(activeRequests).reduce((sum, [key, active]) =>
+    sum + (active > 0 ? desiredProxySlots(key) * 2 : 0), 0);
+  return Math.max(POOL_MIN_OPERATIONAL_TARGET, SLOTS_PER_KEY * currentDemandKeyCount() * 2, trafficTarget);
 }
 
 function currentPoolState(): PoolState {
@@ -1389,26 +1605,6 @@ function currentPoolState(): PoolState {
   if (free >= Math.max(1, Math.round(target * 0.4))) return 'watch';
   if (free >= Math.max(1, Math.round(target * 0.15))) return 'constrained';
   return 'degraded';
-}
-
-function poolGenerationConcurrencyCap(state = currentPoolState()): number {
-  if (state === 'degraded') return 1;
-  if (state === 'constrained') return 2;
-  if (state === 'watch') return Math.max(2, SLOTS_PER_KEY);
-  return Number.POSITIVE_INFINITY;
-}
-
-async function waitForPoolGenerationCapacity(key: string, maxWaitMs = POOL_BACKPRESSURE_WAIT_MS): Promise<{ ok: boolean; state: PoolState; cap: number; waitedMs: number }> {
-  const started = Date.now();
-  for (;;) {
-    const state = currentPoolState();
-    const cap = poolGenerationConcurrencyCap(state);
-    const active = activeRequests[key] || 0;
-    if (!Number.isFinite(cap) || active < cap) return { ok: true, state, cap, waitedMs: Date.now() - started };
-    const waitedMs = Date.now() - started;
-    if (waitedMs >= maxWaitMs) return { ok: false, state, cap, waitedMs };
-    await new Promise(resolve => setTimeout(resolve, Math.min(POOL_BACKPRESSURE_POLL_MS, Math.max(1, maxWaitMs - waitedMs))));
-  }
 }
 
 /** Latency ceiling for admitting a new exit right now. */
@@ -1547,7 +1743,7 @@ function recordCandidateFailure(c: CandidateItem): void {
 // until a real request failed. This sweeps continuously and re-checks exits,
 // including ones already allocated, with at most one in-flight probe per exit
 // so a slow proxy cannot be probed twice at once.
-const PROBER_INTERVAL_MS = parseInt(process.env.PROBER_INTERVAL_MS || `${5 * 60_000}`);
+const PROBER_INTERVAL_MS = parseInt(process.env.PROBER_INTERVAL_MS || '60000');
 const PROBER_SAMPLE = 40;
 const exitProbeInFlight = new Set<string>();
 let lockedProbeCursor = 0;
@@ -1566,10 +1762,11 @@ async function backgroundProbeSweep(): Promise<void> {
     const free = eligible.filter(c => !c.lockedBy && isExitUsable(c.address, undefined));
     const take = (items: CandidateItem[], cursor: number, count: number) =>
       Array.from({ length: Math.min(count, items.length) }, (_, i) => items[(cursor + i) % items.length]);
-    const lockedCount = Math.min(locked.length, Math.ceil(PROBER_SAMPLE / 2));
-    const freeCount = Math.min(free.length, PROBER_SAMPLE - lockedCount);
+    const sample = state === 'healthy' ? PROBER_SAMPLE : PROBER_SAMPLE * 3;
+    const lockedCount = Math.min(locked.length, Math.ceil(sample / 2));
+    const freeCount = Math.min(free.length, sample - lockedCount);
     const targets = [
-      ...take(locked, lockedProbeCursor, PROBER_SAMPLE - freeCount),
+      ...take(locked, lockedProbeCursor, sample - freeCount),
       ...take(free, freeProbeCursor, freeCount),
     ];
     lockedProbeCursor = locked.length ? (lockedProbeCursor + targets.length - freeCount) % locked.length : 0;
@@ -1685,7 +1882,7 @@ interface DispatchResult {
 }
 
 async function proxyViaRelay(
-  path: string, method: string, headers: Record<string, string>, body: string | undefined,
+  path: string, method: string, headers: Record<string, string>, body: string | undefined, signal?: AbortSignal,
 ): Promise<DispatchResult> {
   const relayUrl = ZENPROXY_RELAY + path;
   const relayHeaders: Record<string, string> = { ...headers, 'x-zenproxy-key': ZENPROXY_KEY };
@@ -1694,11 +1891,12 @@ async function proxyViaRelay(
       method,
       headers: relayHeaders,
       body,
-      signal: AbortSignal.timeout(60000),
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(60000)]) : AbortSignal.timeout(60000),
     });
     const bodyText = await res.text();
     return { status: res.status, body: bodyText, responseHeaders: Object.fromEntries(res.headers.entries()) };
   } catch (e: any) {
+    if (signal?.aborted) throw e;
     console.error(`[ZenProxy] relay failed: ${e.message}`);
     return { status: 502, body: JSON.stringify({ error: 'relay_failed', message: e.message }) };
   }
@@ -1731,12 +1929,13 @@ function evictBlockedCandidates(): void {
 }
 
 async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
+  const slotTarget = desiredProxySlots(keyId);
   const activeKeys = new Set([...keySlotPools.keys(), ...keyPoolAllocations.keys()]);
   if (activeKeys.size >= MAX_ACTIVE_KEYS && !activeKeys.has(keyId)) {
     console.log(`[Allocate] Active keys limit reached (${MAX_ACTIVE_KEYS}), rejecting key ${keyId.slice(0, 7)}...`);
     return null;
   }
-  if (candidates.filter(c => !c.lockedBy).length < SLOTS_PER_KEY) {
+  if (candidates.filter(c => !c.lockedBy).length < slotTarget) {
     await loadCandidates();
   }
   const usedAddrs = new Set<string>();
@@ -1772,7 +1971,7 @@ async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
   // geo-blocked and slow exits before any anonymous-lane quota is spent.
   // Only survivors are confirmed against the real upstream below.
   const screened: { item: ProxyItem; latencyMs: number; country: string }[] = [];
-  for (let i = 0; i < pool.length && screened.length < SLOTS_PER_KEY * 3; i += COARSE_FANOUT) {
+  for (let i = 0; i < pool.length && screened.length < slotTarget * 3; i += COARSE_FANOUT) {
     const batch = await Promise.all(pool.slice(i, i + COARSE_FANOUT).map(item => coarseScreen(item, ceilingMs)));
     for (let j = 0; j < batch.length; j++) {
       const r = batch[j];
@@ -1792,16 +1991,16 @@ async function allocateKeySlots(keyId: string): Promise<KeySlotPool | null> {
     console.log(`[Allocate] pool state=${state} (free=${freeExitCount()}), ceiling=${ceilingMs || 'none'}ms, ${screened.length} passed coarse screen`);
   }
 
-  const confirm = screened.slice(0, Math.max(SLOTS_PER_KEY * 2, 12));
+  const confirm = screened.slice(0, Math.max(slotTarget * 2, 12));
   const groupSize = 10;
-  for (let i = 0; i < confirm.length && newSlots.length < SLOTS_PER_KEY; i += groupSize) {
+  for (let i = 0; i < confirm.length && newSlots.length < slotTarget; i += groupSize) {
     const group = confirm.slice(i, i + groupSize);
     const results = await Promise.all(group.map(async (s) => {
       const r = await probe(s.item);
       return { ...s, ...r };
     }));
     for (const r of results) {
-      if (newSlots.length >= SLOTS_PER_KEY) break;
+      if (newSlots.length >= slotTarget) break;
       const cand = candidates.find(c => c.address === r.item.address);
       // Another key or a background sweep may have claimed/evicted this exit
       // while the probes were awaiting network I/O.
@@ -1870,78 +2069,77 @@ function pruneGloballyUnusableSlots(pool: KeySlotPool): number {
   return removed;
 }
 
-const keyPoolTopups = new Map<string, Promise<number>>();
+const keyPoolTopups = new Map<string, { pool: KeySlotPool; model?: string; work: Promise<number> }>();
+// A top-up that found nothing must not be retried by every incoming request.
+const TOPUP_EMPTY_BACKOFF_MS = 5000;
+const keyTopUpBackoffUntil = new Map<string, number>();
+
+// Request-path replenishment: the request already has usable slots, so grow
+// the pool behind it instead of making it wait for probes.
+function replenishInBackground(pool: KeySlotPool): void {
+  if ((keyTopUpBackoffUntil.get(pool.keyId) || 0) > Date.now()) return;
+  topUpKeySlotPool(pool).catch(e => console.warn(`[Allocate+] background top-up failed: ${e?.message || e}`));
+}
+
+function desiredProxySlots(key: string): number {
+  return Math.min(MAX_PROXY_SLOTS_PER_KEY, Math.max(SLOTS_PER_KEY, activeRequests[key] || 0));
+}
 
 async function topUpKeySlotPool(pool: KeySlotPool, model?: string): Promise<number> {
   const pending = keyPoolTopups.get(pool.keyId);
-  if (pending) return pending;
-
+  if (pending?.pool === pool) {
+    if (pending.model === model) return pending.work;
+    // A generic background top-up does not count exits banned for this model;
+    // let it finish, then top up again against the requested model.
+    await pending.work.catch(() => 0);
+    return topUpKeySlotPool(pool, model);
+  }
   const work = (async () => {
     if (keySlotPools.get(pool.keyId) !== pool) return 0;
     pruneGloballyUnusableSlots(pool);
     let added = 0;
-
-    while (pool.slots.length < SLOTS_PER_KEY) {
+    const tried = new Set<string>();
+    const target = () => Math.min(MAX_PROXY_SLOTS_PER_KEY, desiredProxySlots(pool.keyId)
+      + pool.slots.filter(slot => !isExitUsable(slot.addr, model)).length);
+    const confirmationBudget = Math.max(12, target() * 2);
+    while (pool.slots.length < target() && tried.size < confirmationBudget) {
       const attached = new Set(pool.slots.map(slot => slot.addr));
-      const gradeOrder: Record<string, number> = { S: 0, A: 1, B: 2, C: 3 };
-      const available = candidates
-        .filter(c => !c.lockedBy && !attached.has(c.address) && isValidated(c.address) && isExitUsable(c.address, model))
-        .sort((a, b) => {
-          const ga = gradeOrder[a.quality_grade] ?? 99;
-          const gb = gradeOrder[b.quality_grade] ?? 99;
-          if (ga !== gb) return ga - gb;
-          return (a.latency || 9999) - (b.latency || 9999);
-        });
-
-      if (available.length === 0) break;
-
-      let winner: { cand: CandidateItem; latencyMs: number } | null = null;
-      const limit = Math.min(available.length, 12);
-      for (let i = 0; i < limit && !winner; i += 6) {
-        const batch = available.slice(i, i + 6);
-        const results = await Promise.all(batch.map(async cand => ({ cand, ...(await probe(cand)) })));
-        for (const result of results) {
-          if (!result.ok) {
-            if (candidates.includes(result.cand) && !result.cand.lockedBy) recordCandidateFailure(result.cand);
-            continue;
-          }
-          if (!candidates.includes(result.cand) || result.cand.lockedBy || !isExitUsable(result.cand.address, model)) continue;
-          winner = { cand: result.cand, latencyMs: result.latencyMs || result.cand.latency || 0 };
-          break;
-        }
-      }
-
-      if (!winner) break;
+      const available = candidates.filter(c => !c.lockedBy && !attached.has(c.address) && !tried.has(c.address)
+        && isValidated(c.address) && isExitUsable(c.address, model))
+        .sort((a, b) => (a.latency || 9999) - (b.latency || 9999));
+      if (!available.length) break;
+      // Confirm a batch once, then retain every useful winner. Previously each
+      // winner made the same successful neighbours undergo another probe.
+      const batch = available.slice(0, Math.min(12, confirmationBudget - tried.size, Math.max(6, target() - pool.slots.length)));
+      for (const cand of batch) tried.add(cand.address);
+      const results = await Promise.all(batch.map(async cand => ({ cand, ...(await probe(cand)) })));
       if (keySlotPools.get(pool.keyId) !== pool) return added;
-
-      const cand = winner.cand;
-      const url = cand.protocol === 'socks5' ? `socks5h://${cand.address}` : `http://${cand.address}`;
-      pool.slots.push({
-        addr: cand.address,
-        url,
-        proto: cand.protocol as 'http' | 'socks5',
-        latencyMs: winner.latencyMs,
-        qualityGrade: gradeFromLatency(winner.latencyMs),
-      });
-      cand.lockedBy = pool.keyId;
-      cand.failCount = 0;
-      markValidated(cand.address);
-      added++;
-      console.log(`[Allocate+] ${cand.address} (${winner.latencyMs}ms) → Key ${pool.keyId.slice(0, 7)}... top-up ${pool.slots.length}/${SLOTS_PER_KEY}`);
+      for (const result of results) {
+        const cand = result.cand;
+        if (!candidates.includes(cand) || cand.lockedBy) continue;
+        if (!result.ok) { recordCandidateFailure(cand); continue; }
+        if (pool.slots.length >= target() || !isExitUsable(cand.address, model)) continue;
+        const url = cand.protocol === 'socks5' ? `socks5h://${cand.address}` : `http://${cand.address}`;
+        pool.slots.push({ addr: cand.address, url, proto: cand.protocol as 'http' | 'socks5',
+          latencyMs: result.latencyMs || cand.latency || 0, qualityGrade: gradeFromLatency(result.latencyMs || 0) });
+        cand.lockedBy = pool.keyId;
+        cand.failCount = 0;
+        markValidated(cand.address);
+        added++;
+        console.log(`[Allocate+] ${cand.address} → Key ${pool.keyId.slice(0, 7)}... top-up ${pool.slots.length}/${target()}`);
+      }
     }
-
+    if (added > 0) keyTopUpBackoffUntil.delete(pool.keyId);
+    else if (model === undefined && pool.slots.length < target()) keyTopUpBackoffUntil.set(pool.keyId, Date.now() + TOPUP_EMPTY_BACKOFF_MS);
     return added;
   })();
-
-  keyPoolTopups.set(pool.keyId, work);
-  try {
-    return await work;
-  } finally {
-    if (keyPoolTopups.get(pool.keyId) === work) keyPoolTopups.delete(pool.keyId);
-  }
+  keyPoolTopups.set(pool.keyId, { pool, model, work });
+  try { return await work; }
+  finally { if (keyPoolTopups.get(pool.keyId)?.work === work) keyPoolTopups.delete(pool.keyId); }
 }
 
 async function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): Promise<void> {
+  if (isResidentialAddr(failedAddr)) return;
   if (keySlotPools.get(pool.keyId) !== pool) return;
   const idx = pool.slots.findIndex(s => s.addr === failedAddr);
   if (idx >= 0) pool.slots.splice(idx, 1);
@@ -1973,7 +2171,7 @@ async function replaceFailedSlot(pool: KeySlotPool, failedAddr: string): Promise
     }
     const winner = results.find(r => r.ok && candidates.includes(r.cand) && !r.cand.lockedBy && isExitUsable(r.cand.address, undefined));
     if (keySlotPools.get(pool.keyId) !== pool) return;
-    if (winner && pool.slots.length < SLOTS_PER_KEY && !pool.slots.some(s => s.addr === winner.cand.address)) {
+    if (winner && pool.slots.length < desiredProxySlots(pool.keyId) && !pool.slots.some(s => s.addr === winner.cand.address)) {
       const url = winner.cand.protocol === 'socks5' ? `socks5h://${winner.cand.address}` : `http://${winner.cand.address}`;
       const newSlot: Slot = {
         addr: winner.cand.address, url,
@@ -2009,18 +2207,26 @@ async function getKeySlotPool(keyId: string): Promise<KeySlotPool | null> {
         console.log(`[Allocate] Key ${keyId.slice(0,7)}... All fallback slots, candidate pool available, re-allocating`);
         keySlotPools.delete(keyId);
       } else {
+        if (existing.slots.length < desiredProxySlots(keyId)) replenishInBackground(existing);
         return existing;
       }
     }
     console.log(`[Allocate] Key ${keyId.slice(0, 7)}... Slots empty, re-allocating`);
     keySlotPools.delete(keyId);
   }
-  const allocation = allocateKeySlots(keyId);
+  const allocation = (async () => {
+    const pool = await allocateKeySlots(keyId);
+    if (pool) {
+      keySlotPools.set(keyId, pool);
+      // Serve the initial usable routes immediately. Extra demand that arrived
+      // during allocation can grow the shared pool behind these requests.
+      if (pool.slots.length < desiredProxySlots(keyId)) replenishInBackground(pool);
+    }
+    return pool;
+  })();
   keyPoolAllocations.set(keyId, allocation);
   try {
-    const pool = await allocation;
-    if (pool) keySlotPools.set(keyId, pool);
-    return pool;
+    return await allocation;
   } finally {
     keyPoolAllocations.delete(keyId);
   }
@@ -2068,7 +2274,7 @@ async function refreshCandidates(): Promise<void> {
 
 function doHttps(
   path: string, method: string, headers: Record<string, string>,
-  body: string | undefined, agent?: https.Agent,
+  body: string | undefined, agent?: https.Agent, signal?: AbortSignal,
 ): Promise<{ status: number; body: string; headers?: Record<string, string> }> {
   return new Promise((resolve, reject) => {
     const reqHeaders = { ...headers };
@@ -2078,7 +2284,7 @@ function doHttps(
       reqHeaders['content-length'] = String(Buffer.byteLength(body, 'utf-8'));
       delete reqHeaders['transfer-encoding'];
     }
-    const opts: any = { method, headers: reqHeaders, timeout: TIMEOUT, rejectUnauthorized: false };
+    const opts: any = { method, headers: reqHeaders, timeout: TIMEOUT, rejectUnauthorized: false, signal };
     if (agent) opts.agent = agent;
     const req = https.request(`${UPSTREAM}${path}`, opts, (res) => {
       const chunks: Buffer[] = [];
@@ -2097,12 +2303,41 @@ function doHttps(
   });
 }
 
+// An SSE heartbeat or role-only chunk is not enough to commit a generation.
+// Keep the original bytes until a complete productive event or terminal frame.
+function initialSseEvent(frame: string, responses: boolean): boolean {
+  const data = frame.split(/\r?\n/).filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).trimStart()).join('\n').trim();
+  if (!data) return false;
+  if (data === '[DONE]') throw new Error('Upstream SSE ended before a productive event');
+  let event: any;
+  try { event = JSON.parse(data); } catch { throw new Error('Invalid initial upstream SSE event'); }
+  if (event?.error || event?.type === 'error' || event?.type === 'response.failed') {
+    const detail = event.error || event.response?.error || event;
+    const error = new Error(detail.message || 'Upstream SSE reported an error') as Error & { upstreamStatus?: number };
+    const status = Number(detail.status || detail.status_code);
+    error.upstreamStatus = status >= 400 && status <= 599 ? status
+      : /rate.?limit|too many requests/i.test(`${detail.code || detail.type || ''} ${error.message}`) ? 429 : 502;
+    throw error;
+  }
+  if (responses) {
+    if (event.type === 'response.completed' || event.type === 'response.incomplete') return true;
+    if (event.type === 'response.output_item.added' && event.item?.type === 'function_call') return true;
+    return typeof event.delta === 'string' && event.delta.length > 0;
+  }
+  return Array.isArray(event.choices) && event.choices.some((choice: any) => {
+    const delta = choice.delta || {};
+    return choice.finish_reason != null || Boolean(delta.content || delta.reasoning_content || delta.reasoning)
+      || (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0);
+  });
+}
+
 function doHttpsStream(
   path: string, method: string, headers: Record<string, string>,
-  body: string | undefined, agent?: https.Agent,
+  body: string | undefined, agent?: https.Agent, signal?: AbortSignal,
 ): Promise<{ status: number; stream: ReadableStream<Uint8Array>; headers: Record<string, string> }> {
   return new Promise((resolve, reject) => {
-    let resolved = false;
+    if (signal?.aborted) { try { agent?.destroy(); } catch {} reject(signal.reason); return; }
     const reqHeaders = { ...headers };
     delete reqHeaders['accept-encoding'];
     delete reqHeaders['host'];
@@ -2112,128 +2347,99 @@ function doHttpsStream(
     }
     const opts: any = { method, headers: reqHeaders, timeout: STREAM_FIRST_BYTE_TIMEOUT_MS, rejectUnauthorized: false };
     if (agent) opts.agent = agent;
-
-    let cleanedUp = false;
+    let resolved = false;
+    let finished = false;
+    let response: any;
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
     const cleanup = () => {
-      if (cleanedUp) return;
-      cleanedUp = true;
+      if (timer) clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
       try { agent?.destroy(); } catch {}
     };
-
-    const req = https.request(`${UPSTREAM}${path}`, opts, (res) => {
+    const fail = (error: Error) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      if (!resolved) reject(error);
+      else { try { controller?.error(error); } catch {} }
+      try { response?.destroy(); } catch {}
+      try { req.destroy(); } catch {}
+    };
+    const onAbort = () => fail(new Error(signal?.reason?.message || 'Client disconnected'));
+    const req = https.request(`${UPSTREAM}${path}`, opts, res => {
+      response = res;
+      if (finished) { try { res.destroy(); } catch {} return; }
+      // Headers arrived: the absolute first-event deadline now bounds the
+      // prelude. A shorter socket inactivity timer must not cut that wait short.
+      try { req.setTimeout(0); } catch {}
       const resHeaders: Record<string, string> = {};
       for (const [k, v] of Object.entries(res.headers)) {
         if (v) resHeaders[k] = Array.isArray(v) ? v[0] : v;
       }
-
-      const statusCode = res.statusCode || 200;
-      if (statusCode >= 400) {
-        const stream = new ReadableStream<Uint8Array>({
-          start(controller) {
-            res.on('data', (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)));
-            res.on('end', () => {
-              cleanup();
-              try { controller.close(); } catch {}
-            });
-            res.on('error', (e: Error) => {
-              cleanup();
-              try { controller.error(e); } catch {}
-            });
-          },
-          cancel() {
-            cleanup();
-            try { req.destroy(); } catch {}
-            try { res.destroy(); } catch {}
-          },
-        });
-        resolved = true;
-        return resolve({ status: statusCode, stream, headers: resHeaders });
-      }
-
-      let firstChunkReceived = false;
-      let streamController: ReadableStreamDefaultController<Uint8Array> | null = null;
-      const initialChunks: Uint8Array[] = [];
-
+      const status = res.statusCode || 200;
       const stream = new ReadableStream<Uint8Array>({
-        start(controller) {
-          streamController = controller;
-          for (const c of initialChunks) controller.enqueue(c);
-          initialChunks.length = 0;
-        },
+        start(value) { controller = value; },
         cancel() {
+          finished = true;
           cleanup();
           try { req.destroy(); } catch {}
           try { res.destroy(); } catch {}
         },
       });
-
-      res.on('data', (chunk: Buffer) => {
-        try { req.setTimeout(STREAM_IDLE_TIMEOUT_MS); } catch {}
-        const u8 = new Uint8Array(chunk);
-        if (!firstChunkReceived) {
-          firstChunkReceived = true;
-          if (streamController) {
-            streamController.enqueue(u8);
-          } else {
-            initialChunks.push(u8);
-          }
-          resolved = true;
-          resolve({ status: statusCode, stream, headers: resHeaders });
-        } else {
-          try { streamController?.enqueue(u8); } catch {}
-        }
-      });
-
-      res.on('end', () => {
-        cleanup();
-        if (!firstChunkReceived) {
-          if (!resolved) {
-            resolved = true;
-            reject(new Error('Proxy stream closed prematurely without data'));
-          }
-        } else {
-          try { streamController?.close(); } catch {}
-        }
-      });
-
-      res.on('error', (e: Error) => {
-        cleanup();
-        if (!firstChunkReceived) {
-          if (!resolved) {
-            resolved = true;
-            reject(e);
-          }
-        } else {
-          try { streamController?.error(e); } catch {}
-        }
-      });
-      res.on('aborted', () => {
-        const e = new Error('Upstream response aborted before completion');
-        cleanup();
-        if (!firstChunkReceived) {
-          if (!resolved) { resolved = true; reject(e); }
-        } else {
-          try { streamController?.error(e); } catch {}
-        }
-      });
-    });
-
-    req.on('socket', (socket) => {
-      try { socket.setKeepAlive(true, 30_000); } catch {}
-    });
-    req.on('error', (e: Error) => {
-      cleanup();
-      if (!resolved) {
+      const prelude: Uint8Array[] = [];
+      const decoder = new TextDecoder();
+      let pending = '';
+      let bytes = 0;
+      if (status >= 400) {
         resolved = true;
-        reject(e);
-      } else {
-        try { req.destroy(); } catch {}
+        // The complete-request deadline also bounds reading an error body.
+        resolve({ status, stream, headers: resHeaders });
       }
+      res.on('data', (chunk: Buffer) => {
+        if (finished) return;
+        const value = new Uint8Array(chunk);
+        try {
+          if (!resolved) {
+            bytes += value.length;
+            if (bytes > 1024 * 1024) throw new Error('Upstream SSE prelude exceeds 1 MiB');
+            prelude.push(value);
+            pending += decoder.decode(value, { stream: true });
+            for (;;) {
+              const boundary = /\r?\n\r?\n/.exec(pending);
+              if (!boundary) return;
+              const frame = pending.slice(0, boundary.index);
+              pending = pending.slice(boundary.index + boundary[0].length);
+              if (!initialSseEvent(frame, path.includes('/responses'))) continue;
+              resolved = true;
+              if (timer) clearTimeout(timer);
+              try { req.setTimeout(STREAM_IDLE_TIMEOUT_MS); } catch {}
+              for (const part of prelude) controller!.enqueue(part);
+              prelude.length = 0;
+              resolve({ status, stream, headers: resHeaders });
+              return;
+            }
+          }
+          try { req.setTimeout(STREAM_IDLE_TIMEOUT_MS); } catch {}
+          controller!.enqueue(value);
+        } catch (error: any) { fail(error); }
+      });
+      res.on('end', () => {
+        if (finished) return;
+        if (!resolved) { fail(new Error('Upstream SSE closed before a productive event')); return; }
+        finished = true;
+        cleanup();
+        try { controller!.close(); } catch {}
+      });
+      res.on('error', fail);
+      res.on('aborted', () => fail(new Error('Upstream response aborted before completion')));
     });
-    req.on('timeout', () => {
-      cleanup();
-      req.destroy(new Error('Timeout'));
-    });
+    req.on('socket', socket => { try { socket.setKeepAlive(true, 30_000); } catch {} });
+    req.on('error', fail);
+    req.on('timeout', () => fail(new Error('Upstream stream inactivity timeout')));
+    timer = setTimeout(() => fail(new Error('Upstream first SSE event timeout')), STREAM_FIRST_EVENT_TIMEOUT_MS);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) { onAbort(); return; }
     if (body) req.write(body);
     req.end();
   });
@@ -2244,7 +2450,7 @@ type SseTerminalMode = 'chat' | 'responses';
 function monitorUpstreamSse(
   stream: ReadableStream<Uint8Array>,
   mode: SseTerminalMode,
-  callbacks: { onComplete?: () => void; onFailure?: (error: Error) => void } = {},
+  callbacks: { onComplete?: () => void; onFailure?: (error: Error) => void; onCancel?: () => void } = {},
 ): ReadableStream<Uint8Array> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
@@ -2319,6 +2525,7 @@ function monitorUpstreamSse(
     },
     cancel(reason) {
       cancelled = true;
+      callbacks.onCancel?.();
       return reader.cancel(reason);
     },
   });
@@ -2409,8 +2616,9 @@ function extractUsageFromResponse(respBody: string): { tokens: number; model: st
 
 async function dispatchDirect(
   path: string, method: string, headers: Record<string, string>,
-  body: string | undefined, pool: KeySlotPool,
+  body: string | undefined, pool: KeySlotPool, signal?: AbortSignal,
 ): Promise<DispatchResult> {
+  signal?.throwIfAborted();
   let dispatchModel: string | undefined;
   if (body) { try { dispatchModel = (JSON.parse(body) as any)?.model; } catch {} }
   const retryAfter = exitCooldownRemainingSeconds(DIRECT_EXIT_ADDR);
@@ -2423,12 +2631,12 @@ async function dispatchDirect(
       responseHeaders: { 'retry-after': String(wait) },
     };
   }
-  console.log(`[Dispatch] fallback → Direct connection`);
+  console.log(`[Dispatch] route → Direct connection`);
   const start = Date.now();
   try {
     const isStream = isStreamRequest(path, headers, body);
     if (isStream) {
-      const result = await doHttpsStream(path, method, headers, body, undefined);
+      const result = await doHttpsStream(path, method, headers, body, undefined, signal);
       const latencyMs = Date.now() - start;
       if (result.status >= 200 && result.status < 400) {
         stats.total++;
@@ -2437,9 +2645,11 @@ async function dispatchDirect(
           onComplete: () => {
             stats.success++;
             noteExitSuccess(DIRECT_EXIT_ADDR, dispatchModel);
+            recordModelSuccess(dispatchModel);
             console.log('[Dispatch] direct stream completed cleanly');
           },
           onFailure: (error) => {
+            if (signal?.aborted) return;
             stats.errors++;
             const verdict = noteExitFailure(DIRECT_EXIT_ADDR, 0, dispatchModel);
             console.warn(`[Dispatch] direct stream failed after handoff: ${error.message} -> ${verdict}`);
@@ -2469,11 +2679,12 @@ async function dispatchDirect(
       }
       return { status: result.status, body: `{"error":{"message":"Upstream error (${result.status})"}}`, responseHeaders: result.headers };
     }
-    const result = await doHttps(path, method, headers, body, undefined);
+    const result = await doHttps(path, method, headers, body, undefined, signal);
     const latencyMs = Date.now() - start;
     if (result.status >= 200 && result.status < 400) {
       stats.total++; stats.success++;
       noteExitSuccess(DIRECT_EXIT_ADDR, dispatchModel);
+      if (hasModelOutput(result.body)) recordModelSuccess(dispatchModel);
       audit(result.status, latencyMs, 'direct', path, result.body, pool.keyId);
       return { status: result.status, body: result.body };
     }
@@ -2486,37 +2697,72 @@ async function dispatchDirect(
     audit(result.status, latencyMs, 'direct', path, result.body, pool.keyId);
     return { status: result.status, body: result.body, responseHeaders: result.headers };
   } catch (e: any) {
-    stats.total++; stats.errors++;
-    audit(502, Date.now() - start, 'direct', path, JSON.stringify({ error: e.message }), pool.keyId);
-    return { status: 502, body: JSON.stringify({ error: 'all_proxies_failed', message: 'All proxies and direct connection have failed' }) };
+    if (signal?.aborted) throw e;
+    stats.total++;
+    if (e.upstreamStatus === 429) stats.rateLimited++;
+    else stats.errors++;
+    noteExitFailure(DIRECT_EXIT_ADDR, e.upstreamStatus || 0, dispatchModel);
+    const status = e.upstreamStatus || 502;
+    audit(status, Date.now() - start, 'direct', path, JSON.stringify({ error: e.message }), pool.keyId);
+    return { status, body: JSON.stringify({ error: 'upstream_error', message: e.message }),
+      responseHeaders: status === 429 ? { 'retry-after': String(exitCooldownRemainingSeconds(DIRECT_EXIT_ADDR)) } : undefined };
   }
+}
+
+const exitActiveRequests = new Map<string, number>();
+const sessionExits = new Map<string, { addr: string; at: number }>();
+
+function choosePoolSlot(pool: KeySlotPool, model: string | undefined, session: string, tried: Set<string>): Slot | null {
+  const eligible: Slot[] = [];
+  for (let i = 0; i < pool.slots.length; i++) {
+    const slot = pool.slots[(pool.rrCursor + i) % pool.slots.length];
+    if (warpModeRuntime !== 'on' && slot.addr === getWarpAddr()) continue;
+    if (!tried.has(slot.addr) && isExitUsable(slot.addr, model)) eligible.push(slot);
+  }
+  if (!eligible.length) return null;
+  let chosen = eligible.reduce((best, slot) =>
+    (exitActiveRequests.get(slot.addr) || 0) < (exitActiveRequests.get(best.addr) || 0) ? slot : best);
+  const affinity = session ? `${pool.keyId}\x00${model || ''}\x00${session}` : '';
+  const previous = sessionExits.get(affinity);
+  const sticky = previous && Date.now() - previous.at < KEY_IDLE_RELEASE_MS
+    ? eligible.find(slot => slot.addr === previous.addr) : undefined;
+  // Keep sequential turns on their warm exit. Parallel calls can use a less
+  // busy exit instead of piling onto the session's already occupied route.
+  if (sticky && (exitActiveRequests.get(sticky.addr) || 0) <= (exitActiveRequests.get(chosen.addr) || 0)) chosen = sticky;
+  if (affinity) {
+    sessionExits.delete(affinity);
+    sessionExits.set(affinity, { addr: chosen.addr, at: Date.now() });
+    if (sessionExits.size > 4096) sessionExits.delete(sessionExits.keys().next().value!);
+  }
+  pool.rrCursor = (pool.slots.indexOf(chosen) + 1) % pool.slots.length;
+  noteExitUse(chosen.addr);
+  return chosen;
 }
 
 async function dispatch(
   path: string, method: string, headers: Record<string, string>,
   body: string | undefined, pool: KeySlotPool,
-  retry = 0, triedAddrs = new Set<string>(),
+  retry = 0, triedAddrs = new Set<string>(), signal?: AbortSignal,
 ): Promise<DispatchResult> {
+  signal?.throwIfAborted();
 
   // The requested model, used to scope per-(exit x model) bans so a 403 on one
   // model does not evict an exit that is healthy for everything else.
   let dispatchModel: string | undefined;
   if (body) { try { dispatchModel = (JSON.parse(body) as any)?.model; } catch {} }
 
-  // Select slot: round-robin over pool.slots, skipping exits that are cooling
-  // down or banned for this particular model.
-  let selectedSlot: Slot | null = null;
-  for (let i = 0; i < pool.slots.length; i++) {
-    const idx = (pool.rrCursor + i) % pool.slots.length;
-    const s = pool.slots[idx];
-    // Skip WARP slot when WARP is disabled
-    if (warpModeRuntime !== 'on' && s.addr === getWarpAddr()) continue;
-    if (triedAddrs.has(s.addr)) continue;
-    if (!isExitUsable(s.addr, dispatchModel)) continue;
-    selectedSlot = s;
-    pool.rrCursor = (idx + 1) % pool.slots.length;
-    break;
+  // Prefer the server's own IP, including when a warm proxy pool exists.
+  // Rate limits and failures fall through to proxies without repeating direct.
+  if (!triedAddrs.has(DIRECT_EXIT_ADDR)
+      && isExitUsable(DIRECT_EXIT_ADDR, dispatchModel)) {
+    triedAddrs.add(DIRECT_EXIT_ADDR);
+    const direct = await dispatchDirect(path, method, headers, body, pool, signal);
+    if ((direct.status >= 200 && direct.status < 400) || isHardFailure(direct.status)) return direct;
   }
+
+  const session = headers['x-opencode-session'] || '';
+  let selectedSlot = chooseResidentialSlot(dispatchModel, triedAddrs)
+    ?? choosePoolSlot(pool, dispatchModel, session, triedAddrs);
 
   // No available slot → fallback chain
   if (!selectedSlot) {
@@ -2540,24 +2786,14 @@ async function dispatch(
     pruneGloballyUnusableSlots(pool);
     console.log(`[Dispatch] No usable slot for Key ${pool.keyId.slice(0, 7)}..., attempting validated top-up`);
     await topUpKeySlotPool(pool, dispatchModel);
-    for (const slot of pool.slots) {
-      if (triedAddrs.has(slot.addr)) continue;
-      if (!isExitUsable(slot.addr, dispatchModel)) continue;
-      selectedSlot = slot;
-      break;
-    }
+    selectedSlot = choosePoolSlot(pool, dispatchModel, session, triedAddrs);
 
     if (!selectedSlot && pool.slots.length === 0) {
       console.log(`[Dispatch] Key ${pool.keyId.slice(0, 7)}... still empty, attempting full re-allocation`);
       const refilled = await getKeySlotPool(pool.keyId);
       if (refilled && refilled.slots.length > 0) {
         pool = refilled;
-        for (const slot of pool.slots) {
-          if (triedAddrs.has(slot.addr)) continue;
-          if (!isExitUsable(slot.addr, dispatchModel)) continue;
-          selectedSlot = slot;
-          break;
-        }
+        selectedSlot = choosePoolSlot(pool, dispatchModel, session, triedAddrs);
       }
     }
   }
@@ -2566,21 +2802,34 @@ async function dispatch(
     // ZenProxy fallback
     if (ZENPROXY_KEY) {
       console.log(`[Dispatch] all slots failed, fallback → ZenProxy relay`);
-      return proxyViaRelay(path, method, headers, body);
+      return proxyViaRelay(path, method, headers, body, signal);
     }
     // Direct connection fallback (zero-proxy mode)
-    return dispatchDirect(path, method, headers, body, pool);
+    return dispatchDirect(path, method, headers, body, pool, signal);
   }
 
+  signal?.throwIfAborted();
   triedAddrs.add(selectedSlot.addr);
-  const agent = makeAgent(selectedSlot.url, selectedSlot.proto);
+  const addr = selectedSlot.addr;
+  exitActiveRequests.set(addr, (exitActiveRequests.get(addr) || 0) + 1);
+  let released = false;
+  const releaseExit = () => {
+    if (released) return;
+    released = true;
+    const count = (exitActiveRequests.get(addr) || 1) - 1;
+    if (count > 0) exitActiveRequests.set(addr, count);
+    else exitActiveRequests.delete(addr);
+  };
+  let agent: https.Agent;
+  try { agent = makeAgent(selectedSlot.url, selectedSlot.proto); }
+  catch (error) { releaseExit(); throw error; }
   const start = Date.now();
   let isStreamHandedOff = false;
 
   try {
     const isStream = isStreamRequest(path, headers, body);
     if (isStream) {
-      const result = await doHttpsStream(path, method, headers, body, agent);
+      const result = await doHttpsStream(path, method, headers, body, agent, signal);
       const latencyMs = Date.now() - start;
       if (result.status >= 200 && result.status < 400) {
         isStreamHandedOff = true;
@@ -2590,11 +2839,16 @@ async function dispatch(
         audit(result.status, latencyMs, selectedSlot.addr, path, body, pool.keyId);
         const monitored = monitorUpstreamSse(result.stream, path.includes('/responses') ? 'responses' : 'chat', {
           onComplete: () => {
+            releaseExit();
             stats.success++;
             noteExitSuccess(selectedSlot!.addr, dispatchModel);
+            recordModelSuccess(dispatchModel);
             console.log(`[Dispatch] ${selectedSlot!.addr} stream completed cleanly`);
           },
+          onCancel: releaseExit,
           onFailure: (error) => {
+            releaseExit();
+            if (signal?.aborted) return;
             stats.errors++;
             const verdict = noteExitFailure(selectedSlot!.addr, 0, dispatchModel);
             console.warn(`[Dispatch] ${selectedSlot!.addr} stream failed after handoff: ${error.message} -> ${verdict}`);
@@ -2636,19 +2890,19 @@ async function dispatch(
       // If proxy returned "Model is unavailable" (datacenter proxy geoblocked), try direct fallback
       if (errBody && errBody.includes('Model is unavailable')) {
         console.log(`[Dispatch] Model unavailable via proxy ${selectedSlot.addr}, attempting direct fallback...`);
-        const directRes = await dispatchDirect(path, method, headers, body, pool);
+        const directRes = await dispatchDirect(path, method, headers, body, pool, signal);
         if (directRes.status >= 200 && directRes.status < 400) return directRes;
       }
-      if (retry < MAX_RETRIES) {
-        return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs);
+      if (retry < maxRetries()) {
+        return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs, signal);
       }
       console.log(`[Dispatch] All proxy retries exhausted for ${path}, attempting direct fallback...`);
-      const directRes = await dispatchDirect(path, method, headers, body, pool);
+      const directRes = await dispatchDirect(path, method, headers, body, pool, signal);
       if (directRes.status >= 200 && directRes.status < 400) return directRes;
       if (directRes.status === 429 || directRes.status === 503) return directRes;
       return { status: result.status, body: errBody, responseHeaders: result.headers };
     } else {
-      const result = await doHttps(path, method, headers, body, agent);
+      const result = await doHttps(path, method, headers, body, agent, signal);
       const latencyMs = Date.now() - start;
       if (result.status >= 200 && result.status < 400) {
         stats.total++;
@@ -2656,6 +2910,7 @@ async function dispatch(
         console.log(`[Dispatch] ${selectedSlot.addr} OK ${result.status} (${latencyMs}ms) pool=${pool.keyId.slice(0,7)}...`);
         rememberRetryAfter(selectedSlot.addr, result.headers);
         noteExitSuccess(selectedSlot.addr, dispatchModel);
+        if (hasModelOutput(result.body)) recordModelSuccess(dispatchModel);
         audit(result.status, latencyMs, selectedSlot.addr, path, result.body, pool.keyId);
         return { status: result.status, body: result.body };
       }
@@ -2675,36 +2930,39 @@ async function dispatch(
       // If proxy returned "Model is unavailable", try direct fallback
       if (result.body && result.body.includes('Model is unavailable')) {
         console.log(`[Dispatch] Model unavailable via proxy ${selectedSlot.addr}, attempting direct fallback...`);
-        const directRes = await dispatchDirect(path, method, headers, body, pool);
+        const directRes = await dispatchDirect(path, method, headers, body, pool, signal);
         if (directRes.status >= 200 && directRes.status < 400) return directRes;
       }
-      if (retry < MAX_RETRIES) {
-        return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs);
+      if (retry < maxRetries()) {
+        return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs, signal);
       }
       console.log(`[Dispatch] All proxy retries exhausted for ${path}, attempting direct fallback...`);
-      const directRes = await dispatchDirect(path, method, headers, body, pool);
+      const directRes = await dispatchDirect(path, method, headers, body, pool, signal);
       if (directRes.status >= 200 && directRes.status < 400) return directRes;
       if (directRes.status === 429 || directRes.status === 503) return directRes;
       return { status: result.status, body: result.body, responseHeaders: result.headers };
     }
   } catch (e: any) {
+    if (signal?.aborted) throw e;
     stats.total++;
-    stats.errors++;
+    if (e.upstreamStatus === 429) stats.rateLimited++;
+    else stats.errors++;
     console.error(`[Dispatch] ${selectedSlot.addr} exception: ${e.message} retry=${retry}`);
-    const verdict = noteExitFailure(selectedSlot.addr, 0, dispatchModel);
+    const verdict = noteExitFailure(selectedSlot.addr, e.upstreamStatus || 0, dispatchModel);
     console.log(`[Dispatch] ${selectedSlot.addr} transport exception -> ${verdict}`);
     replaceFailedSlot(pool, selectedSlot.addr);
     audit(502, Date.now() - start, selectedSlot.addr, path, JSON.stringify({ error: e.message }), pool.keyId);
-    if (retry < MAX_RETRIES) {
-      return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs);
+    if (retry < maxRetries()) {
+      return dispatch(path, method, headers, body, pool, retry + 1, triedAddrs, signal);
     }
     console.log(`[Dispatch] All proxy attempts failed with exception, attempting direct fallback...`);
-    const directRes = await dispatchDirect(path, method, headers, body, pool);
+    const directRes = await dispatchDirect(path, method, headers, body, pool, signal);
     if (directRes.status >= 200 && directRes.status < 400) return directRes;
     if (directRes.status === 429 || directRes.status === 503) return directRes;
     return { status: 502, body: JSON.stringify({ error: 'proxy_error', message: e.message }) };
   } finally {
     if (!isStreamHandedOff) {
+      releaseExit();
       try { agent.destroy(); } catch {}
     }
   }
@@ -2824,12 +3082,26 @@ function collectHeadersFromReq(nodeReq: http.IncomingMessage, bodyStr?: string):
   return h;
 }
 
-function readBody(nodeReq: http.IncomingMessage): Promise<string> {
+function readBody(nodeReq: http.IncomingMessage, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    nodeReq.on('data', (c: Buffer) => chunks.push(c));
-    nodeReq.on('end', () => resolve(Buffer.concat(chunks).toString('utf-8')));
-    nodeReq.on('error', reject);
+    const cleanup = () => {
+      nodeReq.removeListener('data', onData);
+      nodeReq.removeListener('end', onEnd);
+      nodeReq.removeListener('error', onError);
+      nodeReq.removeListener('aborted', onAbort);
+      signal?.removeEventListener('abort', onAbort);
+    };
+    const onData = (chunk: Buffer) => chunks.push(chunk);
+    const onEnd = () => { cleanup(); resolve(Buffer.concat(chunks).toString('utf-8')); };
+    const onError = (error: Error) => { cleanup(); reject(error); };
+    const onAbort = () => onError(new Error('Client disconnected during request body'));
+    nodeReq.on('data', onData);
+    nodeReq.once('end', onEnd);
+    nodeReq.once('error', onError);
+    nodeReq.once('aborted', onAbort);
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted || nodeReq.aborted) onAbort();
   });
 }
 
@@ -2856,8 +3128,11 @@ function sendJson(nodeRes: http.ServerResponse, status: number, data: any) {
 }
 
 // Native Responses clients keep their response schema when stream:false.
-async function collectResponsesStream(stream: ReadableStream<Uint8Array>): Promise<{ status: number; body: string }> {
+async function collectResponsesStream(stream: ReadableStream<Uint8Array>, signal?: AbortSignal): Promise<{ status: number; body: string }> {
   const reader = stream.getReader();
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
   const decoder = new TextDecoder();
   let buffer = '';
   let response: any;
@@ -2882,15 +3157,23 @@ async function collectResponsesStream(stream: ReadableStream<Uint8Array>): Promi
     return { status: 200, body: JSON.stringify(response) };
   } catch (e: any) {
     return { status: 502, body: JSON.stringify({ error: { message: e?.message || 'stream read failed' } }) };
-  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  } finally {
+    signal?.removeEventListener('abort', cancel);
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
 }
 
 // Reassemble Chat SSE into JSON, including streamed function calls.
 async function collectChatStream(
   stream: ReadableStream<Uint8Array>,
   fallbackModel: string,
+  signal?: AbortSignal,
 ): Promise<{ status: number; body: string }> {
   const reader = stream.getReader();
+  const cancel = () => { void reader.cancel().catch(() => {}); };
+  signal?.addEventListener('abort', cancel, { once: true });
+  if (signal?.aborted) cancel();
   const decoder = new TextDecoder();
   let buffer = '';
   let text = '';
@@ -2947,7 +3230,11 @@ async function collectChatStream(
     }
   } catch (e: any) {
     return { status: 502, body: JSON.stringify({ error: { message: e?.message || 'stream read failed' } }) };
-  } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
+  } finally {
+    signal?.removeEventListener('abort', cancel);
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
 
   if (!text && !toolCalls.size && totalTokens === 0) {
     return { status: 502, body: JSON.stringify({ error: { message: 'upstream produced no content' } }) };
@@ -3357,6 +3644,13 @@ function getModelHealth(model: string): ModelHealth | undefined {
   return freeModelHealth.get(resolveAliasId(model));
 }
 
+function recordModelSuccess(model: string | undefined): void {
+  if (!model) return;
+  freeModelHealth.set(resolveAliasId(model), {
+    verdict: 'healthy', status: 200, reason: 'ok', consecutiveFails: 0, checkedAt: Date.now(),
+  });
+}
+
 // Reject empty HTTP 200 streams and provider errors carried inside SSE.
 function hasModelOutput(body: string): boolean {
   const docs: any[] = [];
@@ -3377,10 +3671,10 @@ function hasModelOutput(body: string): boolean {
 }
 
 async function probeFreeModel(model: string): Promise<ModelHealth> {
-  const prev = getModelHealth(model);
   const target = resolveAliasId(model);
   let status = 0;
   let reason = '';
+  let accessRejected = false;
   try {
     const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
       let req: http.ClientRequest;
@@ -3464,6 +3758,7 @@ async function probeFreeModel(model: string): Promise<ModelHealth> {
       try {
         const doc: any = JSON.parse(result.body);
         reason = doc?.error?.message || doc?.message || reason || `HTTP ${status}`;
+        accessRejected = status === 403 && doc?.error?.type === 'FreeTierError';
       } catch {
         reason = reason || `HTTP ${status}`;
       }
@@ -3473,11 +3768,14 @@ async function probeFreeModel(model: string): Promise<ModelHealth> {
     reason = e?.message || String(e);
   }
 
+  // Real traffic may complete while this probe is in flight.
+  const prev = getModelHealth(model);
   let health: ModelHealth;
   if (status >= 200 && status < 400) {
     health = { verdict: 'healthy', status, reason: 'ok', consecutiveFails: 0, checkedAt: Date.now() };
-  } else if (isTransientStatus(status)) {
-    // Keep whatever verdict we had; a blip must not blacklist a working model.
+  } else if (isTransientStatus(status) || accessRejected) {
+    // A probe rejected for client context does not establish model availability.
+    // Preserve evidence from real traffic, including confirmed model failures.
     health = {
       verdict: prev && prev.verdict !== 'unknown' ? prev.verdict : 'unknown',
       status, reason: reason || `HTTP ${status}`,
@@ -3676,6 +3974,8 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
           grade: s.qualityGrade,
         })),
         lastUsedAt: pool.lastUsedAt,
+        activeRequests: activeRequests[keyId] || 0,
+        targetSlots: desiredProxySlots(keyId),
         requestCount: apiKeys[keyId]?.requestCount || 0,
       });
     }
@@ -3690,6 +3990,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       activeKeys: keySlotPools.size,
       maxActiveKeys: MAX_ACTIVE_KEYS,
       slotCount: SLOTS_PER_KEY,
+      maxProxySlotsPerKey: MAX_PROXY_SLOTS_PER_KEY,
       slotsReady,
       pools: poolsInfo,
       warpAvailable: !!warpSlot,
@@ -3698,10 +3999,13 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       candidatesCount: candidates.length,
       candidates: candidates.length,
       customSlotsCount: customSlots.length,
+      exitBudget: { limit: PUBLIC_EXIT_BUDGET, windowMinutes: Math.round(PUBLIC_EXIT_WINDOW_MS / 60_000), retired: [...exitUseWindow.keys()].filter(exitBudgetExhausted).length },
+      residential: { count: residentialSlots.length, coolingDown: residentialSlots.filter(s => exitCooldownRemainingSeconds(s.addr) > 0).length },
       totalApiKeys: Object.keys(apiKeys).length,
       timeouts: {
         nonStreamMs: TIMEOUT,
         streamFirstByteMs: STREAM_FIRST_BYTE_TIMEOUT_MS,
+        streamFirstEventMs: STREAM_FIRST_EVENT_TIMEOUT_MS,
         streamIdleMs: STREAM_IDLE_TIMEOUT_MS,
         proxyConnectMs: PROXY_CONNECT_TIMEOUT_MS,
         proxyProbeMs: PROXY_PROBE_TIMEOUT,
@@ -3716,7 +4020,8 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
         target: operationalPoolTarget(),
         capacityTarget: POOL_CAPACITY_TARGET,
         demandKeys: currentDemandKeyCount(),
-        backpressureWaitMs: POOL_BACKPRESSURE_WAIT_MS,
+        backpressureWaitMs: 0,
+        generationConcurrencyLimit: null,
         admitCeilingMs: admissionCeilingMs(),
         validatedTotal: validatedExits.size,
         grades: candidates.reduce((acc: any, c) => {
@@ -4263,10 +4568,17 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       sendJson(nodeRes, 404, { error: 'unsupported_endpoint', message: 'Use /v1/models, /v1/chat/completions or /v1/responses' });
       return;
     }
+    const clientAbort = new AbortController();
+    const clientSignal = clientAbort.signal;
+    nodeRes.once('close', () => {
+      if (!nodeRes.writableFinished) clientAbort.abort(new Error('Client disconnected'));
+    });
+    nodeReq.once('aborted', () => clientAbort.abort(new Error('Client disconnected')));
     let bodyStr: string | undefined;
     try {
-      if (isGeneration) { await ensureModelCatalog(); bodyStr = await readBody(nodeReq); }
+      if (isGeneration) { await ensureModelCatalog(); bodyStr = await readBody(nodeReq, clientSignal); }
     } catch (e: any) {
+      if (clientSignal.aborted) return;
       sendJson(nodeRes, 503, { error: 'model_catalog_unavailable', message: e?.message || String(e) });
       return;
     }
@@ -4298,7 +4610,11 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       if (substitutedFrom) {
         console.log(`[Models] ${substitutedFrom} is dead upstream, serving ${substitutedTo} instead`);
       }
-      const shaped = shapeAgentRequest(bodyStr as string, upstreamPath === '/v1/responses' ? 'responses' : 'chat');
+      // A real OpenCode client already sends an agent-shaped turn, and Zen now
+      // answers 403 if that body is rewritten, so it goes through untouched.
+      const shaped = isNativeOpenCodeRequest(nodeReq, bodyStr as string)
+        ? { body: bodyStr as string, callerWantsStream: true, reshaped: false }
+        : shapeAgentRequest(bodyStr as string, upstreamPath === '/v1/responses' ? 'responses' : 'chat');
       bodyStr = shaped.body;
       callerWantsStream = shaped.callerWantsStream;
       if (shaped.reshaped) {
@@ -4332,34 +4648,15 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
     const reqHeaders = collectHeadersFromReq(nodeReq, bodyStr);
     // Recheck immediately before reservation: catalog/body awaits above may
     // have admitted another request or allowed a key to expire/be disabled.
-    // Explicit per-key policy takes precedence over adaptive pool backpressure.
+    // Reservation stays synchronous with validation so simultaneous requests
+    // cannot bypass an explicitly configured per-key policy. Pool health only
+    // controls proxy replenishment; spare exits do not limit active streams.
     const admission = validateKey(authKey);
     if (!admission.ok) {
       sendJson(nodeRes, 403, { error: 'forbidden', message: admission.reason });
       return;
     }
-    // Under low-capacity pool states, protect the few surviving exits from a
-    // thundering herd. This only applies when the key itself permits more
-    // concurrency than the current proxy reserve can safely support.
-    if (isGeneration) {
-      const capacity = await waitForPoolGenerationCapacity(authKey);
-      if (capacity.waitedMs > 0) {
-        console.log(`[Admission] pool=${capacity.state} cap=${capacity.cap} key=${authKey.slice(0, 7)}... waited=${capacity.waitedMs}ms`);
-      }
-      if (!capacity.ok) {
-        const active = activeRequests[authKey] || 0;
-        console.log(`[Admission] pool=${capacity.state} active=${active} cap=${capacity.cap} key=${authKey.slice(0, 7)}... -> backpressure`);
-        sendJsonWithHeaders(nodeRes, 503, {
-          type: 'pool_backpressure',
-          message: `Proxy pool is ${capacity.state}; retry after current generation traffic drains.`,
-          poolState: capacity.state,
-          activeRequests: active,
-          concurrencyCap: capacity.cap,
-          waitedMs: capacity.waitedMs,
-        }, { 'retry-after': '5' });
-        return;
-      }
-    }
+    if (clientSignal.aborted || nodeRes.destroyed) return;
     acquireKey(authKey);
     if (isGeneration) recordKeyRequest(authKey);
 
@@ -4402,13 +4699,24 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       // (all public candidates dead), fall through to the direct-connection
       // fallback inside dispatch() instead of 503 — direct works fine and
       // a failed proxy must not make the gateway unavailable.
-      let pool = await getKeySlotPool(authKey);
+      const requestedModel = bodyStr ? JSON.parse(bodyStr).model : undefined;
+      // Allocate proxies only when direct egress cannot serve this model.
+      // Warm pools remain available as fallback after a direct failure.
+      let pool = isExitUsable(DIRECT_EXIT_ADDR, requestedModel)
+        ? keySlotPools.get(authKey) || { keyId: authKey, slots: [], rrCursor: 0, lastUsedAt: Date.now() }
+        : await getKeySlotPool(authKey);
       if (!pool) {
         console.log(`[Allocate] Key ${authKey.slice(0,7)}... No proxy slot, using direct fallback`);
         pool = { keyId: authKey, slots: [], rrCursor: 0, lastUsedAt: Date.now() };
       }
 
-      const result = await dispatch(upstreamPath + search, method, reqHeaders, bodyStr, pool);
+      pool.lastUsedAt = Date.now();
+      clientSignal.throwIfAborted();
+      const result = await dispatchPatiently(upstreamPath + search, method, reqHeaders, bodyStr, pool, clientSignal);
+      if (clientSignal.aborted) {
+        await result.stream?.cancel().catch(() => {});
+        return;
+      }
 
       // A Responses-only model asked for over /chat/completions is served by
       // /v1/responses instead, then translated back into chat SSE so the
@@ -4431,8 +4739,9 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
             try { return (JSON.parse(bodyStr || '{}') as any)?.model || ''; } catch { return ''; }
           })();
           const collected = upstreamPath === '/v1/responses' && !usedResponses
-            ? await collectResponsesStream(result.stream)
-            : await collectChatStream(result.stream, substitutedTo || requestedModel);
+            ? await collectResponsesStream(result.stream, clientSignal)
+            : await collectChatStream(result.stream, substitutedTo || requestedModel, clientSignal);
+          if (clientSignal.aborted) return;
           const usage = extractUsageFromResponse(collected.body);
           if (usage.tokens > 0) recordKeyUsage(authKey, usage.tokens);
           nodeRes.writeHead(collected.status, {
@@ -4467,10 +4776,12 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
         });
         const reader = result.stream.getReader();
         let clientClosed = false;
-        nodeReq.on('close', () => {
+        const cancelReader = () => {
           clientClosed = true;
           reader.cancel().catch(() => {});
-        });
+        };
+        clientSignal.addEventListener('abort', cancelReader, { once: true });
+        if (clientSignal.aborted) cancelReader();
         let streamUsageBuffer = '';
         let streamTokens = 0;
         const streamDecoder = new TextDecoder();
@@ -4514,6 +4825,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
             } catch {}
           }
         } finally {
+          clientSignal.removeEventListener('abort', cancelReader);
           nodeRes.end();
           if (streamTokens > 0) recordKeyUsage(authKey, streamTokens);
         }
@@ -4537,6 +4849,7 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
         nodeRes.end(respBody);
       }
     } catch (e: any) {
+      if (clientSignal.aborted) return;
       console.error(`[Request] Exception: ${e.message}`);
       sendJson(nodeRes, 502, { error: 'gateway_error', message: e.message });
     } finally {
@@ -4654,6 +4967,7 @@ async function main() {
 
   // Initialize custom proxies
   await initCustomSlots();
+  loadResidentialSlots();
 
   // Re-validate exits shortly after boot so the first allocation already knows
   // which proxies are alive instead of discovering it one request at a time.
@@ -4673,9 +4987,9 @@ async function main() {
   setInterval(verifyFreeModels, MODEL_VERIFY_INTERVAL_MS);
 
   // Start HTTP server
-  process.on('SIGUSR1', () => {
+  if (process.env.SUPERVISED_RUNTIME === '1') process.on('SIGUSR1', () => {
     runtimeDraining = true;
-    console.log('[Runtime] Drain mode enabled; shared state persistence paused');
+    console.log('[Runtime] Drain mode enabled; only key usage counters are still persisted');
   });
 
   server.listen(PORT, HOST, () => {

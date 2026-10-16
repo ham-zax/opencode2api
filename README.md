@@ -29,6 +29,26 @@ Direct access to free AI tiers on OpenCode Zen often results in strict single-IP
 3. **Smart 429 Bypass & Failover**: Applying exponential backoff to rate-limited nodes while preserving prompt cache affinity on active nodes.
 4. **Drop-in OpenAI & OpenCode2 Compatibility**: Exposing standard `/v1/chat/completions` and `/v1/models` alongside a built-in web management dashboard.
 
+Generation requests first use the server's own IP whenever that route is usable,
+including when an existing proxy pool is warm. Rate limits and retryable failures
+fall through to proxies. Direct routing resumes after its cooldown expires.
+The gateway does not predict remaining upstream quota.
+
+Generation requests have no automatic concurrency limit or pool admission queue,
+including when spare proxy capacity is degraded. Each key starts with three
+proxy routes and can grow to sixteen as concurrent demand rises; retained
+routes do not limit admitted requests. Sequential turns prefer their previous
+healthy exit, while parallel traffic can use a less-busy exit. Extra routes are
+confirmed in the background once usable routes exist, including for a new pool.
+Per-key concurrency and request
+limits default to `0` (unlimited); administrators can still set explicit limits.
+Upstream rate limits and proxy failures can still produce retryable errors.
+
+Upstream streams are buffered until a complete productive SSE event arrives,
+so early empty/error streams can fail over before delivery. The initial wait
+and buffer are bounded; streams are never replayed after handoff. Client
+disconnects cancel worker/upstream connections and release request occupancy.
+
 ---
 
 ## ✨ Key Features
@@ -36,7 +56,7 @@ Direct access to free AI tiers on OpenCode Zen often results in strict single-IP
 - 🔄 **Native OpenCode & OpenCode2 Support**: Direct provider integration via `@ai-sdk/openai-compatible` in `~/.config/opencode/opencode.json`.
 - ⚡ **OpenAI-Compatible Endpoint**: Drop-in replacement for OpenAI SDK, Cursor, Claude Code, Cline, and Continue.
 - 🛡️ **Per-Key Slot Allocation**: Each API key holds an isolated pool of proxy slots with independent health monitoring.
-- 🚀 **Multi-Tier Fallback Chain**: `Proxy Pool Slots` ➔ `Cloudflare Anycast IPs` ➔ `WARP Tunnel` ➔ `Custom Proxies` ➔ `Direct Upstream`.
+- 🚀 **Multi-Tier Fallback Chain**: `Direct Upstream` first, then usable residential, pool, WARP, and custom proxy routes.
 - 🤖 **Automated Daily Anycast IP Refresh**: Built-in GitHub Actions workflow and local benchmark script to rank top 500 low-latency edge IPs daily.
 - 📊 **Built-In Web Dashboard**: Live traffic analytics, key management, candidate pool health tester, real-time logs, and chat playground.
 - 📦 **Zero-Config Deployment**: Optimized Bun and Docker Compose setup.
@@ -148,7 +168,13 @@ bun test
 ./scripts/reload-runtime.sh
 ```
 
-`SIGHUP` starts a replacement worker, waits for its `/api/status` health check and runtime-generation marker, switches new requests atomically, then drains the previous worker. Inspect the routing layer at `GET /__supervisor/status`.
+`SIGHUP` starts a replacement worker, waits for its `/api/status` health check and runtime-generation marker, switches new requests atomically, then drains the previous worker. Inspect the routing layer at `GET /__supervisor/status` (loopback clients only). `scripts/reload-runtime.sh` waits up to `OPENCODE2API_RELOAD_WAIT_SECONDS` (default 150) for the new generation.
+
+Notes:
+- If the active worker crashes, the supervisor starts a replacement automatically; `SIGTERM`/`SIGINT` cancels pending readiness checks and waits for active, draining, and starting workers to exit.
+- Key usage counters (`totalRequests`, `requestCount`, `totalTokens`, `lastUsedAt`) are merged additively into `keys.json`, so usage from both generations during an overlap is kept. The merge is read-modify-write, so a very small race window remains between processes.
+- Per-key `maxConcurrency` is enforced separately by each generation, so during a reload overlap a key may briefly exceed its limit.
+- Avoid key admin changes (create/update/delete) while a reload is in progress: the replacement worker loaded `keys.json` when it started, and it overwrites non-counter edits made through the old worker during that window.
 
 ---
 
@@ -311,14 +337,22 @@ OpenCode2API can be configured via environment variables in `docker-compose.yml`
 | `PORT` | `13339` | HTTP port for API and Dashboard. |
 | `API_KEY` | `admin123` | Default master administrator API key. |
 | `DATA_DIR` | `./data` | Directory for persistent storage (`keys.json`, `sources.json`, `audit.jsonl`). |
-| `SLOTS_PER_KEY` | `3` | Number of concurrent proxy slots allocated per API key. |
+| `RESIDENTIAL_PROXIES` | _(empty)_ | Paid residential exits (comma/newline separated; `scheme://user:pass@host:port`, `host:port:user:pass` or `host:port`). Also read from `DATA_DIR/residential_proxies.txt` (keep it mode 600). Tried before any public proxy, never evicted, and logged without credentials. |
+| `DISPATCH_PATIENCE_MS` | `20000` | When every exit is cooling down after a 429/503, hold the request for the soonest recovery up to this long instead of returning the error. `0` disables. |
+| `PUBLIC_EXIT_BUDGET` | `60` | Public-pool rotation: a shared public exit is retired after this many requests inside `PUBLIC_EXIT_WINDOW_MS`, before Zen's per-IP limit hits it, and a fresh validated exit replaces it. Residential, WARP, direct and custom exits are exempt. `0` disables. |
+| `PUBLIC_EXIT_WINDOW_MS` | `3600000` | Length of the per-exit budget window (one hour). |
+| `SLOTS_PER_KEY` | `3` | Fixed minimum proxy routes per API key, not a generation concurrency limit. |
+| `MAX_PROXY_SLOTS_PER_KEY` | `16` | Maximum retained proxy routes per key as concurrent demand grows. Does not limit admitted generations. |
 | `MAX_ACTIVE_KEYS` | `20` | Maximum number of keys active simultaneously. |
 | `WARP_MODE` | `off` | Enable Cloudflare WARP fallback (`on` / `off` / `fallback`). |
 | `WARP_HOST` | `127.0.0.1` | Host address of local WARP SOCKS5 service. |
 | `WARP_SOCKS5_PORT`| `1080` | Port of WARP SOCKS5 service. |
 | `PROXY_REFRESH_MS`| `300000` | Interval (ms) for refreshing candidate proxy pools (5 min). |
+| `PROBER_INTERVAL_MS` | `60000` | Background reachability sweep interval. Healthy pools sample up to 40 candidates; low-capacity pools sample up to 120. |
 | `PROXY_CONNECT_TIMEOUT_MS` | `15000` | Timeout (ms) for establishing a proxy connection; kept separate from generation lifetime. |
-| `STREAM_FIRST_BYTE_TIMEOUT_MS` | `30000` | Maximum wait (ms) for the first upstream SSE bytes before the attempt is treated as stalled and can fail over. |
+| `STREAM_FIRST_BYTE_TIMEOUT_MS` | `30000` | Socket timeout (ms) while waiting for upstream response headers. After headers, the absolute first-event deadline bounds the prelude; after productive output, the idle timeout applies. |
+| `STREAM_FIRST_EVENT_TIMEOUT_MS` | `120000` | Complete-attempt deadline (ms) for the first productive SSE event (never below `STREAM_FIRST_BYTE_TIMEOUT_MS`). Heartbeats and partial frames do not extend it; buffered prelude is capped at 1 MiB. |
+| `WORKER_READY_TIMEOUT_MS` | `120000` | Supervisor: how long a replacement worker may take to pass its readiness check. |
 | `STREAM_IDLE_TIMEOUT_MS` | `600000` | Upstream SSE inactivity timeout (ms). Each received chunk refreshes the idle timer; this is not a total generation deadline. |
 | `CLASH_SUBSCRIBE_URLS`| *(FreeSub YAML)* | Comma-separated Clash/Mihomo subscription URLs. |
 | `PROXY_POOL_URL` | `""` | Optional external proxy pool API endpoint. |
