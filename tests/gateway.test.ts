@@ -95,6 +95,7 @@ function fixture(probeTimeout = 2500, env: Record<string, string> = {}) {
        setAllocator(value) { allocateKeySlots = value; },
        setHttpsRequest(value) { https.request = value; },
        setDispatch(value) { dispatch = value; },
+       setDirectDispatch(value) { dispatchDirect = value; },
        setKeys(value) { apiKeys = value; },
        getKeys() { return apiKeys; },
        setModels(value) { cachedModels = value; cachedModelsTime = Date.now(); },
@@ -140,6 +141,58 @@ const healthy = async () => ({ ok: true, latencyMs: 100, country: 'US', reason: 
 const dead = async () => ({ ok: false, latencyMs: 100, country: '', reason: 'unreachable' });
 
 describe('proxy pool regression checks', () => {
+  test('cold routing uses direct before starting proxy allocation or private retries', async () => {
+    const g = fixture();
+    g.setAllocator(() => { throw new Error('allocation must not delay direct routing'); });
+    g.setResidential([{ addr: 'res:203.0.113.1:80', url: 'http://203.0.113.1:80', proto: 'http' }]);
+    let calls = 0;
+    g.setDirectDispatch(async () => { calls++; return { status: 200, body: 'OK' }; });
+    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, '{"model":"big-pickle"}',
+      { keyId: 'key', slots: [], rrCursor: 0, lastUsedAt: g.now });
+    expect(result.status).toBe(200);
+    expect(calls).toBe(1);
+    expect(g.requests).toBe(0);
+  });
+
+  test('warm routing uses direct before existing public and residential proxies', async () => {
+    const g = fixture();
+    let calls = 0;
+    g.setResidential([{ addr: 'res:203.0.113.3:80', url: 'http://203.0.113.3:80', proto: 'http' }]);
+    g.setDirectDispatch(async () => { calls++; return { status: 200, body: 'OK' }; });
+    const slots = [1, 2].map(i => ({ addr: `203.0.113.${i}:8080`, url: `http://203.0.113.${i}:8080`, proto: 'http' }));
+    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, '{"model":"big-pickle"}',
+      { keyId: 'key', slots, rrCursor: 0, lastUsedAt: g.now });
+    expect(result.status).toBe(200);
+    expect(calls).toBe(1);
+    expect(g.requests).toBe(0);
+  });
+
+  test('direct rate limits fall back to a warm proxy and direct resumes after cooldown', async () => {
+    const g = fixture();
+    const first = 'data: {"choices":[{"delta":{"content":"OK"},"finish_reason":null}]}\n\n';
+    const final = 'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n';
+    g.queueStreams([
+      ['data: {"error":{"message":"Rate limit exceeded","type":"rate_limit"}}\n\n'],
+      [first, final],
+      [first, final],
+    ]);
+    const pool = { keyId: 'key', slots: [{ addr: '203.0.113.1:8080', url: 'http://203.0.113.1:8080', proto: 'http' }], rrCursor: 0, lastUsedAt: g.now };
+    const body = '{"model":"big-pickle","stream":true}';
+    const initial = await g.dispatch('/v1/chat/completions', 'POST', {}, body, pool);
+    expect(await new Response(initial.stream).text()).toBe(first + final);
+    expect(g.requests).toBe(2);
+    expect(g.isExitUsable('__direct__', 'big-pickle')).toBe(false);
+    const duringCooldown = await g.dispatch('/v1/chat/completions', 'POST', {}, body, pool);
+    expect(await new Response(duringCooldown.stream).text()).toBe(first + final);
+    expect(g.requests).toBe(3);
+    g.advance(60 * 60_000);
+    let directCalls = 0;
+    g.setDirectDispatch(async () => { directCalls++; return { status: 200, body: 'OK' }; });
+    expect((await g.dispatch('/v1/chat/completions', 'POST', {}, body, pool)).status).toBe(200);
+    expect(directCalls).toBe(1);
+    expect(g.requests).toBe(3);
+  });
+
   test('health counts only fresh, unlocked, usable exits', () => {
     const g = fixture();
     const items = [candidate(1), candidate(2, 'key'), candidate(3), candidate(4)];
@@ -590,6 +643,22 @@ describe('HTTP compatibility', () => {
       const response = await fetch(base + '/openai/v1/models', { headers });
       expect(response.status).toBe(200);
       expect((await response.json()).data.map((m: any) => m.id)).toEqual(['big-pickle']);
+    });
+  });
+
+  test('a cold HTTP generation never waits for proxy allocation while direct is usable', async () => {
+    await withServer(async (base, g) => {
+      g.setAllocator(() => { throw new Error('unexpected blocking allocation'); });
+      g.setDispatch(async () => ({ status: 200, stream: replyStream() }));
+      const response = await fetch(base + '/v1/chat/completions', { method: 'POST', headers, body: completion(false) });
+      expect(response.status).toBe(200);
+      expect((await response.json()).choices[0].message.content).toBe('OK');
+      const warm = { keyId: 'test-key', slots: [], rrCursor: 0, lastUsedAt: 0 };
+      g.keySlotPools.set('test-key', warm);
+      g.advance(10);
+      const next = await fetch(base + '/v1/chat/completions', { method: 'POST', headers, body: completion(false) });
+      await next.text();
+      expect(warm.lastUsedAt).toBe(g.now);
     });
   });
 
@@ -1061,6 +1130,32 @@ describe('Zen discovery and health', () => {
     expect((await pending).status).toBe(0);
   });
 
+  test('probe client restrictions preserve model evidence instead of declaring models dead', async () => {
+    const g = fixture();
+    g.echo({ error: { type: 'FreeTierError', message: 'client context required' } }, 0, 403);
+    expect((await g.probeFreeModel('big-pickle')).verdict).toBe('unknown');
+    expect(g.workingFreeModelIds()).toEqual([]);
+    g.setModels([{ id: 'big-pickle' }]);
+    expect(g.workingFreeModelIds()).toEqual(['big-pickle']);
+    g.freeModelHealth.set('big-pickle', { verdict: 'healthy', status: 200, reason: 'ok', consecutiveFails: 0 });
+    expect((await g.probeFreeModel('big-pickle')).verdict).toBe('healthy');
+    g.echo({ error: { message: 'model unavailable' } }, 0, 403);
+    expect((await g.probeFreeModel('big-pickle')).verdict).toBe('dead');
+  });
+
+  test('only a completed generation establishes model health', async () => {
+    const g = fixture();
+    const pool = { keyId: 'key', slots: [], rrCursor: 0, lastUsedAt: g.now };
+    const body = JSON.stringify({ model: 'big-pickle', stream: true });
+    g.echoStream(['data: {"choices":[{"delta":{"content":"OK"},"finish_reason":"stop"}]}\n\n', 'data: [DONE]\n\n']);
+    const result = await g.dispatchDirect('/v1/chat/completions', 'POST', {}, body, pool);
+    expect(g.freeModelHealth.has('big-pickle')).toBe(false);
+    await new Response(result.stream).text();
+    expect(g.freeModelHealth.get('big-pickle').verdict).toBe('healthy');
+    g.echo({ error: { type: 'FreeTierError', message: 'client context required' } }, 0, 403);
+    expect((await g.probeFreeModel('big-pickle')).verdict).toBe('healthy');
+  });
+
   test('tool-free callers keep inert upstream stubs and explicit no-tool instructions', () => {
     const g = fixture();
     for (const endpoint of ['chat', 'responses'] as const) {
@@ -1320,7 +1415,7 @@ describe('stream admission and exit routing', () => {
     const g = fixture();
     g.queueStreams([['data: {"error":{"message":"Rate limit exceeded","type":"rate_limit"}}\n\n'], [first, final]]);
     const p = pool('203.0.113.1:8080', '203.0.113.2:8080');
-    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p);
+    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p, 0, new Set(['__direct__']));
     expect(await new Response(result.stream).text()).toBe(first + final);
     expect(g.requests).toBe(2);
     expect(g.isExitUsable(p.slots[0].addr, 'big-pickle')).toBe(false);
@@ -1339,7 +1434,7 @@ describe('stream admission and exit routing', () => {
     g.hang();
     const control = new AbortController();
     const p = pool('203.0.113.1:8080');
-    const pending = g.dispatch('/v1/chat/completions', 'POST', {}, body, p, 0, new Set(), control.signal);
+    const pending = g.dispatch('/v1/chat/completions', 'POST', {}, body, p, 0, new Set(['__direct__']), control.signal);
     control.abort(new Error('cancelled by caller'));
     await expect(pending).rejects.toThrow('cancelled by caller');
     expect(g.exitHealth.size).toBe(0);
@@ -1353,7 +1448,7 @@ describe('stream admission and exit routing', () => {
     g.echoStream([first], true);
     const control = new AbortController();
     const p = pool('203.0.113.1:8080');
-    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p, 0, new Set(), control.signal);
+    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p, 0, new Set(['__direct__']), control.signal);
     expect(g.exitActiveRequests.get(p.slots[0].addr)).toBe(1);
     control.abort(new Error('cancelled by caller'));
     await expect(new Response(result.stream).text()).rejects.toThrow('cancelled by caller');
@@ -1378,7 +1473,7 @@ describe('stream admission and exit routing', () => {
     const g = fixture();
     g.echoStream([first], true);
     const p = pool('203.0.113.1:8080');
-    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p);
+    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p, 0, new Set(['__direct__']));
     expect(g.exitActiveRequests.get(p.slots[0].addr)).toBe(1);
     await result.stream.cancel();
     expect(g.exitActiveRequests.size).toBe(0);
@@ -1389,7 +1484,7 @@ describe('stream admission and exit routing', () => {
     const g = fixture();
     g.echoStream([first]);
     const p = pool('203.0.113.1:8080');
-    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p);
+    const result = await g.dispatch('/v1/chat/completions', 'POST', {}, body, p, 0, new Set(['__direct__']));
     await expect(new Response(result.stream).text()).rejects.toThrow();
     expect(g.exitHealth.get(p.slots[0].addr)?.fails).toBe(1);
     expect(g.exitActiveRequests.size).toBe(0);

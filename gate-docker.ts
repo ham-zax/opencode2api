@@ -652,10 +652,11 @@ function isTransientStatus(status: number): boolean {
 }
 
 // A deterministic rejection the same request will hit again next time: the
-// free tier is locked to the OpenCode client (403), or the provider does not
+// provider rejects access (401/403), or the provider does not
 // offer the model (400/404/422). Retrying cannot help, so these go straight to
 // dead on the first observation instead of burning three verification passes
 // (90 minutes at the default interval) while callers keep getting raw errors.
+// FreeTierError from a synthetic probe is client-context evidence only.
 function isHardFailure(status: number): boolean {
   return status === 400 || status === 401 || status === 403 || status === 404 || status === 422;
 }
@@ -900,7 +901,7 @@ function noteExitFailure(addr: string, status: number, model?: string): string {
   if (status === 429) {
     const s = exitState(addr);
     s.cooldownStreak = Math.min(s.cooldownStreak + 1, 4);
-    // The server's own egress is the last resort, so it recovers on a short leash.
+    // The preferred direct route recovers on a short leash.
     const cap = addr === DIRECT_EXIT_ADDR ? DIRECT_COOLDOWN_MAX_MS : EXIT_COOLDOWN_MAX_MS;
     let delay = Math.min(EXIT_COOLDOWN_BASE_MS * Math.pow(2, s.cooldownStreak - 1), cap);
     const ra = Number(proxyRetryAfterMs.get(addr) || 0);
@@ -2630,7 +2631,7 @@ async function dispatchDirect(
       responseHeaders: { 'retry-after': String(wait) },
     };
   }
-  console.log(`[Dispatch] fallback → Direct connection`);
+  console.log(`[Dispatch] route → Direct connection`);
   const start = Date.now();
   try {
     const isStream = isStreamRequest(path, headers, body);
@@ -2644,6 +2645,7 @@ async function dispatchDirect(
           onComplete: () => {
             stats.success++;
             noteExitSuccess(DIRECT_EXIT_ADDR, dispatchModel);
+            recordModelSuccess(dispatchModel);
             console.log('[Dispatch] direct stream completed cleanly');
           },
           onFailure: (error) => {
@@ -2682,6 +2684,7 @@ async function dispatchDirect(
     if (result.status >= 200 && result.status < 400) {
       stats.total++; stats.success++;
       noteExitSuccess(DIRECT_EXIT_ADDR, dispatchModel);
+      if (hasModelOutput(result.body)) recordModelSuccess(dispatchModel);
       audit(result.status, latencyMs, 'direct', path, result.body, pool.keyId);
       return { status: result.status, body: result.body };
     }
@@ -2747,6 +2750,15 @@ async function dispatch(
   // model does not evict an exit that is healthy for everything else.
   let dispatchModel: string | undefined;
   if (body) { try { dispatchModel = (JSON.parse(body) as any)?.model; } catch {} }
+
+  // Prefer the server's own IP, including when a warm proxy pool exists.
+  // Rate limits and failures fall through to proxies without repeating direct.
+  if (!triedAddrs.has(DIRECT_EXIT_ADDR)
+      && isExitUsable(DIRECT_EXIT_ADDR, dispatchModel)) {
+    triedAddrs.add(DIRECT_EXIT_ADDR);
+    const direct = await dispatchDirect(path, method, headers, body, pool, signal);
+    if ((direct.status >= 200 && direct.status < 400) || isHardFailure(direct.status)) return direct;
+  }
 
   const session = headers['x-opencode-session'] || '';
   let selectedSlot = chooseResidentialSlot(dispatchModel, triedAddrs)
@@ -2830,6 +2842,7 @@ async function dispatch(
             releaseExit();
             stats.success++;
             noteExitSuccess(selectedSlot!.addr, dispatchModel);
+            recordModelSuccess(dispatchModel);
             console.log(`[Dispatch] ${selectedSlot!.addr} stream completed cleanly`);
           },
           onCancel: releaseExit,
@@ -2897,6 +2910,7 @@ async function dispatch(
         console.log(`[Dispatch] ${selectedSlot.addr} OK ${result.status} (${latencyMs}ms) pool=${pool.keyId.slice(0,7)}...`);
         rememberRetryAfter(selectedSlot.addr, result.headers);
         noteExitSuccess(selectedSlot.addr, dispatchModel);
+        if (hasModelOutput(result.body)) recordModelSuccess(dispatchModel);
         audit(result.status, latencyMs, selectedSlot.addr, path, result.body, pool.keyId);
         return { status: result.status, body: result.body };
       }
@@ -3630,6 +3644,13 @@ function getModelHealth(model: string): ModelHealth | undefined {
   return freeModelHealth.get(resolveAliasId(model));
 }
 
+function recordModelSuccess(model: string | undefined): void {
+  if (!model) return;
+  freeModelHealth.set(resolveAliasId(model), {
+    verdict: 'healthy', status: 200, reason: 'ok', consecutiveFails: 0, checkedAt: Date.now(),
+  });
+}
+
 // Reject empty HTTP 200 streams and provider errors carried inside SSE.
 function hasModelOutput(body: string): boolean {
   const docs: any[] = [];
@@ -3650,10 +3671,10 @@ function hasModelOutput(body: string): boolean {
 }
 
 async function probeFreeModel(model: string): Promise<ModelHealth> {
-  const prev = getModelHealth(model);
   const target = resolveAliasId(model);
   let status = 0;
   let reason = '';
+  let accessRejected = false;
   try {
     const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
       let req: http.ClientRequest;
@@ -3737,6 +3758,7 @@ async function probeFreeModel(model: string): Promise<ModelHealth> {
       try {
         const doc: any = JSON.parse(result.body);
         reason = doc?.error?.message || doc?.message || reason || `HTTP ${status}`;
+        accessRejected = status === 403 && doc?.error?.type === 'FreeTierError';
       } catch {
         reason = reason || `HTTP ${status}`;
       }
@@ -3746,11 +3768,14 @@ async function probeFreeModel(model: string): Promise<ModelHealth> {
     reason = e?.message || String(e);
   }
 
+  // Real traffic may complete while this probe is in flight.
+  const prev = getModelHealth(model);
   let health: ModelHealth;
   if (status >= 200 && status < 400) {
     health = { verdict: 'healthy', status, reason: 'ok', consecutiveFails: 0, checkedAt: Date.now() };
-  } else if (isTransientStatus(status)) {
-    // Keep whatever verdict we had; a blip must not blacklist a working model.
+  } else if (isTransientStatus(status) || accessRejected) {
+    // A probe rejected for client context does not establish model availability.
+    // Preserve evidence from real traffic, including confirmed model failures.
     health = {
       verdict: prev && prev.verdict !== 'unknown' ? prev.verdict : 'unknown',
       status, reason: reason || `HTTP ${status}`,
@@ -4674,12 +4699,18 @@ const server = http.createServer(async (nodeReq, nodeRes) => {
       // (all public candidates dead), fall through to the direct-connection
       // fallback inside dispatch() instead of 503 — direct works fine and
       // a failed proxy must not make the gateway unavailable.
-      let pool = await getKeySlotPool(authKey);
+      const requestedModel = bodyStr ? JSON.parse(bodyStr).model : undefined;
+      // Allocate proxies only when direct egress cannot serve this model.
+      // Warm pools remain available as fallback after a direct failure.
+      let pool = isExitUsable(DIRECT_EXIT_ADDR, requestedModel)
+        ? keySlotPools.get(authKey) || { keyId: authKey, slots: [], rrCursor: 0, lastUsedAt: Date.now() }
+        : await getKeySlotPool(authKey);
       if (!pool) {
         console.log(`[Allocate] Key ${authKey.slice(0,7)}... No proxy slot, using direct fallback`);
         pool = { keyId: authKey, slots: [], rrCursor: 0, lastUsedAt: Date.now() };
       }
 
+      pool.lastUsedAt = Date.now();
       clientSignal.throwIfAborted();
       const result = await dispatchPatiently(upstreamPath + search, method, reqHeaders, bodyStr, pool, clientSignal);
       if (clientSignal.aborted) {

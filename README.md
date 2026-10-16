@@ -29,6 +29,11 @@ Direct access to free AI tiers on OpenCode Zen often results in strict single-IP
 3. **Smart 429 Bypass & Failover**: Applying exponential backoff to rate-limited nodes while preserving prompt cache affinity on active nodes.
 4. **Drop-in OpenAI & OpenCode2 Compatibility**: Exposing standard `/v1/chat/completions` and `/v1/models` alongside a built-in web management dashboard.
 
+Generation requests first use the server's own IP whenever that route is usable,
+including when an existing proxy pool is warm. Rate limits and retryable failures
+fall through to proxies. Direct routing resumes after its cooldown expires.
+The gateway does not predict remaining upstream quota.
+
 Generation requests have no automatic concurrency limit or pool admission queue,
 including when spare proxy capacity is degraded. Each key starts with three
 proxy routes and can grow to sixteen as concurrent demand rises; retained
@@ -51,7 +56,7 @@ disconnects cancel worker/upstream connections and release request occupancy.
 - 🔄 **Native OpenCode & OpenCode2 Support**: Direct provider integration via `@ai-sdk/openai-compatible` in `~/.config/opencode/opencode.json`.
 - ⚡ **OpenAI-Compatible Endpoint**: Drop-in replacement for OpenAI SDK, Cursor, Claude Code, Cline, and Continue.
 - 🛡️ **Per-Key Slot Allocation**: Each API key holds an isolated pool of proxy slots with independent health monitoring.
-- 🚀 **Multi-Tier Fallback Chain**: `Proxy Pool Slots` ➔ `Cloudflare Anycast IPs` ➔ `WARP Tunnel` ➔ `Custom Proxies` ➔ `Direct Upstream`.
+- 🚀 **Multi-Tier Fallback Chain**: `Direct Upstream` first, then usable residential, pool, WARP, and custom proxy routes.
 - 🤖 **Automated Daily Anycast IP Refresh**: Built-in GitHub Actions workflow and local benchmark script to rank top 500 low-latency edge IPs daily.
 - 📊 **Built-In Web Dashboard**: Live traffic analytics, key management, candidate pool health tester, real-time logs, and chat playground.
 - 📦 **Zero-Config Deployment**: Optimized Bun and Docker Compose setup.
